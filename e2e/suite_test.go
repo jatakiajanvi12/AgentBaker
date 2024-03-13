@@ -2,8 +2,7 @@ package e2e_test
 
 import (
 	"context"
-	"flag"
-	"fmt"
+	"log"
 	mrand "math/rand"
 	"path/filepath"
 	"testing"
@@ -11,92 +10,93 @@ import (
 
 	"github.com/Azure/agentbaker/pkg/agent/datamodel"
 	"github.com/Azure/agentbakere2e/scenario"
-	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
+	"github.com/Azure/agentbakere2e/suite"
 	"github.com/barkimedes/go-deepcopy"
 )
-
-var e2eMode string
-
-func init() {
-	flag.StringVar(&e2eMode, "e2eMode", "", "specify mode for e2e tests - 'coverage' or 'validation' - default: 'validation'")
-}
 
 func Test_All(t *testing.T) {
 	r := mrand.New(mrand.NewSource(time.Now().UnixNano()))
 	ctx := context.Background()
 	t.Parallel()
 
-	suiteConfig, err := newSuiteConfig()
+	suiteConfig, err := suite.NewConfigForEnvironment()
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	log.Printf("suite config:\n%s", suiteConfig.String())
 
 	if err := createE2ELoggingDir(); err != nil {
 		t.Fatal(err)
 	}
 
-	scenarioTable := scenario.InitScenarioTable(t, suiteConfig.scenariosToRun)
+	scenarios, err := scenario.GetScenariosForSuite(ctx, suiteConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(scenarios) < 1 {
+		t.Fatal("at least one scenario must be selected to run the e2e suite")
+	}
 
-	cloud, err := newAzureClient(suiteConfig.subscription)
+	cloud, err := newAzureClient(suiteConfig.Subscription)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if err := ensureResourceGroup(ctx, t, cloud, suiteConfig.resourceGroupName); err != nil {
+	if err := ensureResourceGroup(ctx, cloud, suiteConfig); err != nil {
 		t.Fatal(err)
 	}
 
-	clusters, err := listClusters(ctx, t, cloud, suiteConfig.resourceGroupName)
+	clusterConfigs, err := getInitialClusterConfigs(ctx, cloud, suiteConfig.ResourceGroupName)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	paramCache := paramCache{}
+	if err := createMissingClusters(ctx, r, cloud, suiteConfig, scenarios, &clusterConfigs); err != nil {
+		t.Fatal(err)
+	}
 
-	for _, scenario := range scenarioTable {
-		scenario := scenario
+	for _, e2eScenario := range scenarios {
+		e2eScenario := e2eScenario
 
-		kube, cluster, clusterParams, subnetID := mustChooseCluster(ctx, t, r, cloud, suiteConfig, scenario, &clusters, paramCache)
-
-		clusterName := *cluster.Name
-		t.Logf("chose cluster: %q", clusterName)
-
-		baseConfig, err := getBaseNodeBootstrappingConfiguration(ctx, t, cloud, suiteConfig, clusterParams)
+		clusterConfig, err := chooseCluster(ctx, r, cloud, suiteConfig, e2eScenario, clusterConfigs)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		copied, err := deepcopy.Anything(baseConfig)
+		clusterName := *clusterConfig.cluster.Name
+		log.Printf("chose cluster: %q", clusterName)
+
+		baseNodeBootstrappingConfig, err := getBaseNodeBootstrappingConfiguration(ctx, cloud, suiteConfig, clusterConfig.parameters)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		copied, err := deepcopy.Anything(baseNodeBootstrappingConfig)
 		if err != nil {
 			t.Error(err)
 			continue
 		}
 		nbc := copied.(*datamodel.NodeBootstrappingConfiguration)
 
-		if scenario.Config.BootstrapConfigMutator != nil {
-			scenario.Config.BootstrapConfigMutator(nbc)
-		}
+		e2eScenario.PrepareNodeBootstrappingConfiguration(nbc)
 
-		t.Run(scenario.Name, func(t *testing.T) {
+		t.Run(e2eScenario.Name, func(t *testing.T) {
 			t.Parallel()
 
-			caseLogsDir, err := createVMLogsDir(scenario.Name)
+			loggingDir, err := createVMLogsDir(e2eScenario.Name)
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			opts := &scenarioRunOpts{
+			runScenario(ctx, t, r, &scenarioRunOpts{
+				clusterConfig: clusterConfig,
 				cloud:         cloud,
-				kube:          kube,
 				suiteConfig:   suiteConfig,
-				scenario:      scenario,
-				chosenCluster: cluster,
+				scenario:      e2eScenario,
 				nbc:           nbc,
-				subnetID:      subnetID,
-				loggingDir:    caseLogsDir,
-			}
-
-			runScenario(ctx, t, r, opts)
+				loggingDir:    loggingDir,
+			})
 		})
 	}
 }
@@ -108,23 +108,41 @@ func runScenario(ctx context.Context, t *testing.T, r *mrand.Rand, opts *scenari
 		return
 	}
 
-	vmssName, vmssModel, cleanupVMSS, err := bootstrapVMSS(ctx, t, r, opts, publicKeyBytes)
-	if cleanupVMSS != nil {
+	vmssName := getVmssName(r)
+	log.Printf("vmss name: %q", vmssName)
+
+	vmssSucceeded := true
+	vmssModel, cleanupVMSS, err := bootstrapVMSS(ctx, t, r, vmssName, opts, publicKeyBytes)
+	if !opts.suiteConfig.KeepVMSS && cleanupVMSS != nil {
 		defer cleanupVMSS()
 	}
-	isCSEError := isVMExtensionProvisioningError(err)
-	vmssSucceeded := true
 	if err != nil {
 		vmssSucceeded = false
-		if !isCSEError {
-			t.Fatal("Encountered an unknown error while creating VM:", err)
+		if !isVMExtensionProvisioningError(err) {
+			t.Fatalf("encountered an unknown error while creating VM: %s", err)
 		}
-		t.Log("VM was unable to be provisioned due to a CSE error, will still atempt to extract provisioning logs...")
+		log.Println("vm was unable to be provisioned due to a CSE error, will still atempt to extract provisioning logs...")
 	}
 
-	if vmssModel != nil {
-		if err := writeToFile(filepath.Join(opts.loggingDir, "vmssId.txt"), *vmssModel.ID); err != nil {
-			t.Fatal("failed to write vmss resource ID to disk", err)
+	if opts.suiteConfig.KeepVMSS {
+		defer func() {
+			log.Printf("vmss %q will be retained for debugging purposes, please make sure to manually delete it later", vmssName)
+			if vmssModel != nil {
+				log.Printf("retained vmss resource ID: %q", *vmssModel.ID)
+			} else {
+				log.Printf("WARNING: model of retained vmss %q is nil", vmssName)
+			}
+			if err := writeToFile(filepath.Join(opts.loggingDir, "sshkey"), string(privateKeyBytes)); err != nil {
+				t.Fatalf("failed to write retained vmss %q private ssh key to disk: %s", vmssName, err)
+			}
+		}()
+	} else {
+		if vmssModel != nil {
+			if err := writeToFile(filepath.Join(opts.loggingDir, "vmssId.txt"), *vmssModel.ID); err != nil {
+				t.Fatalf("failed to write vmss resource ID to disk: %s", err)
+			}
+		} else {
+			log.Printf("WARNING: bootstrapped vmss model was nil for %s", vmssName)
 		}
 	}
 
@@ -134,92 +152,40 @@ func runScenario(ctx context.Context, t *testing.T, r *mrand.Rand, opts *scenari
 	}
 
 	// Perform posthoc log extraction when the VMSS creation succeeded or failed due to a CSE error
-	if vmssSucceeded || isCSEError {
-		debug := func() {
-			err := pollExtractVMLogs(ctx, t, vmssName, vmPrivateIP, privateKeyBytes, opts)
-			if err != nil {
-				t.Fatal(err)
-			}
+	defer func() {
+		err := pollExtractVMLogs(ctx, vmssName, vmPrivateIP, privateKeyBytes, opts)
+		if err != nil {
+			t.Fatal(err)
 		}
-		defer debug()
-	}
+	}()
 
 	// Only perform node readiness/pod-related checks when VMSS creation succeeded
 	if vmssSucceeded {
-		t.Log("vmss creation succeded, proceeding with node readiness and pod checks...")
-		nodeName, err := validateNodeHealth(ctx, t, opts.kube, vmssName)
+		log.Println("vmss creation succeded, proceeding with node readiness and pod checks...")
+		nodeName, err := validateNodeHealth(ctx, opts.clusterConfig.kube, vmssName)
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		if opts.nbc.AgentPoolProfile.WorkloadRuntime == datamodel.WasmWasi {
-			t.Log("wasm scenario: running wasm validation...")
-			if err := ensureWasmRuntimeClasses(ctx, opts.kube); err != nil {
+			log.Println("wasm scenario: running wasm validation...")
+			if err := ensureWasmRuntimeClasses(ctx, opts.clusterConfig.kube); err != nil {
 				t.Fatalf("unable to ensure wasm RuntimeClasses: %s", err)
 			}
-			if err := validateWasm(ctx, opts.kube, nodeName, string(privateKeyBytes)); err != nil {
+			if err := validateWasm(ctx, opts.clusterConfig.kube, nodeName, string(privateKeyBytes)); err != nil {
 				t.Fatalf("unable to validate wasm: %s", err)
 			}
 		}
 
-		t.Logf("node is ready, proceeding with validation commands...")
+		log.Println("node is ready, proceeding with validation commands...")
 
-		err = runLiveVMValidators(ctx, t, *vmssModel.Name, vmPrivateIP, string(privateKeyBytes), opts)
+		err = runLiveVMValidators(ctx, vmssName, vmPrivateIP, string(privateKeyBytes), opts)
 		if err != nil {
-			t.Fatalf("VM validation failed: %s", err)
+			t.Fatalf("vm validation failed: %s", err)
 		}
 
-		t.Log("node bootstrapping succeeded!")
+		log.Println("node bootstrapping succeeded!")
+	} else {
+		t.Fatal("vmss was unable to be properly created and bootstrapped")
 	}
-}
-
-func bootstrapVMSS(ctx context.Context, t *testing.T, r *mrand.Rand, opts *scenarioRunOpts, publicKeyBytes []byte) (string, *armcompute.VirtualMachineScaleSet, func(), error) {
-	nodeBootstrappingFn := getNodeBootstrappingFn(e2eMode)
-	nodeBootstrapping, err := nodeBootstrappingFn(ctx, opts.nbc)
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("unable to get node bootstrapping: %w", err)
-	}
-
-	vmssName := fmt.Sprintf("abtest%s", randomLowercaseString(r, 4))
-	t.Logf("vmss name: %q", vmssName)
-
-	cleanupVMSS := func() {
-		t.Log("deleting vmss", vmssName)
-		poller, err := opts.cloud.vmssClient.BeginDelete(ctx, *opts.chosenCluster.Properties.NodeResourceGroup, vmssName, nil)
-		if err != nil {
-			t.Error("error deleting vmss", vmssName, err)
-			return
-		}
-		_, err = poller.PollUntilDone(ctx, nil)
-		if err != nil {
-			t.Error("error polling deleting vmss", vmssName, err)
-		}
-		t.Logf("finished deleting vmss %q", vmssName)
-	}
-
-	vmssModel, err := createVMSSWithPayload(ctx, nodeBootstrapping.CustomData, nodeBootstrapping.CSE, vmssName, publicKeyBytes, opts)
-	if err != nil {
-		return "", nil, nil, fmt.Errorf("unable to create VMSS with payload: %w", err)
-	}
-
-	return vmssName, vmssModel, cleanupVMSS, nil
-}
-
-func validateNodeHealth(ctx context.Context, t *testing.T, kube *kubeclient, vmssName string) (string, error) {
-	nodeName, err := waitUntilNodeReady(ctx, kube, vmssName)
-	if err != nil {
-		return "", fmt.Errorf("error waiting for node ready: %w", err)
-	}
-
-	nginxPodName, err := ensureTestNginxPod(ctx, kube, nodeName)
-	if err != nil {
-		return "", fmt.Errorf("error waiting for pod ready: %w", err)
-	}
-
-	err = waitUntilPodDeleted(ctx, kube, nginxPodName)
-	if err != nil {
-		return "", fmt.Errorf("error waiting pod deleted: %w", err)
-	}
-
-	return nodeName, nil
 }

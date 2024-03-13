@@ -16,6 +16,7 @@ ERR_STOP_OR_DISABLE_NTP_TIMEOUT=13 {{/* Timeout waiting for ntp stop */}}
 ERR_CHRONY_INSTALL_TIMEOUT=14 {{/*Unable to install CHRONY */}}
 ERR_CHRONY_START_TIMEOUT=15 {{/* Unable to start CHRONY */}}
 
+
 echo "Sourcing tool_installs_ubuntu.sh"
 
 installAscBaseline() {
@@ -68,11 +69,54 @@ installBcc() {
     fi
 }
 
-disableNtpAndTimesyncdInstallChrony() {
-    # Disable systemd-timesyncd
-    systemctl_stop 20 30 120 systemd-timesyncd || exit $ERR_STOP_OR_DISABLE_SYSTEMD_TIMESYNCD_TIMEOUT
-    systemctl disable systemd-timesyncd || exit $ERR_STOP_OR_DISABLE_SYSTEMD_TIMESYNCD_TIMEOUT
+installBpftrace() {
+    local version="v0.9.4"
+    local bpftrace_bin="bpftrace"
+    local bpftrace_tools="bpftrace-tools.tar"
+    local bpftrace_url="https://upstreamartifacts.azureedge.net/$bpftrace_bin/$version"
+    local bpftrace_filepath="/usr/local/bin/$bpftrace_bin"
+    local tools_filepath="/usr/local/share/$bpftrace_bin"
+    if [[ $(isARM64) == 1 ]]; then
+        # install bpftrace tool using default bpftrace apt package
+        # the binary at "$bpftrace_url/$bpftrace_bin" is not for arm64
+        if [[ ! -f "/usr/sbin/bpftrace" ]]; then
+            apt_get_update || exit $ERR_APT_UPDATE_TIMEOUT
+            apt_get_install 120 5 300 bpftrace || exit $ERR_BPFTRACE_TOOLS_INSTALL_TIMEOUT
+        fi
+        return
+    fi
 
+    if [[ -f "$bpftrace_filepath" ]]; then
+        installed_version="$($bpftrace_bin -V | cut -d' ' -f2)"
+        if [[ "$version" == "$installed_version" ]]; then
+            return
+        fi
+        rm "$bpftrace_filepath"
+        if [[ -d "$tools_filepath" ]]; then
+            rm -r  "$tools_filepath"
+        fi
+    fi
+    mkdir -p "$tools_filepath"
+    install_dir="$BPFTRACE_DOWNLOADS_DIR/$version"
+    mkdir -p "$install_dir"
+    download_path="$install_dir/$bpftrace_tools"
+    retrycmd_if_failure 30 5 60 curl -fSL -o "$bpftrace_filepath" "$bpftrace_url/$bpftrace_bin" || exit $ERR_BPFTRACE_BIN_DOWNLOAD_FAIL
+    retrycmd_if_failure 30 5 60 curl -fSL -o "$download_path" "$bpftrace_url/$bpftrace_tools" || exit $ERR_BPFTRACE_TOOLS_DOWNLOAD_FAIL
+    tar -xvf "$download_path" -C "$tools_filepath"
+    chmod +x "$bpftrace_filepath"
+    chmod -R +x "$tools_filepath/tools"
+}
+
+disableNtpAndTimesyncdInstallChrony() {
+    # Disable systemd-timesyncd if present
+    status=$(systemctl show -p SubState --value systemd-timesyncd)
+    if [ $status == 'dead' ]; then
+        echo "systemd-timesyncd is removed, no need to disable"
+    else
+        systemctl_stop 20 30 120 systemd-timesyncd || exit $ERR_STOP_OR_DISABLE_SYSTEMD_TIMESYNCD_TIMEOUT
+        systemctl disable systemd-timesyncd || exit $ERR_STOP_OR_DISABLE_SYSTEMD_TIMESYNCD_TIMEOUT
+    fi
+    
     # Disable ntp if present
     status=$(systemctl show -p SubState --value ntp)
     if [ $status == 'dead' ]; then
@@ -150,31 +194,8 @@ installFIPS() {
         fi
     done
 
-    echo "auto attaching ua..."
-    retrycmd_if_failure 5 10 120 ua auto-attach || exit $ERR_AUTO_UA_ATTACH
-
-    echo "disabling ua livepatch..."
-    retrycmd_if_failure 5 10 300 echo y | ua disable livepatch
-
     echo "enabling ua fips-updates..."
     retrycmd_if_failure 5 10 1200 echo y | ua enable fips-updates || exit $ERR_UA_ENABLE_FIPS
-
-    # 'ua status' for logging
-    ua status
-
-    echo "detaching ua..."
-    retrycmd_if_failure 5 10 120 printf "y\nN" | ua detach || $ERR_UA_DETACH
-
-    # now the fips packages/kernel are installed, clean up apt settings in the vhd,
-    # the VMs created on customers' subscriptions don't have access to UA repo
-    rm -f /etc/apt/trusted.gpg.d/ubuntu-advantage-esm-apps.gpg
-    rm -f /etc/apt/trusted.gpg.d/ubuntu-advantage-esm-infra-trusty.gpg
-    rm -f /etc/apt/trusted.gpg.d/ubuntu-advantage-fips.gpg
-    rm -f /etc/apt/sources.list.d/ubuntu-esm-apps.list
-    rm -f /etc/apt/sources.list.d/ubuntu-esm-infra.list
-    rm -f /etc/apt/sources.list.d/ubuntu-fips-updates.list
-    rm -f /etc/apt/auth.conf.d/*ubuntu-advantage
-    apt_get_update || exit $ERR_APT_UPDATE_TIMEOUT
 }
 
 relinkResolvConf() {
@@ -189,4 +210,28 @@ relinkResolvConf() {
 
 listInstalledPackages() {
     apt list --installed
+}
+
+autoAttachUA() {
+    echo "auto attaching ua..."
+    retrycmd_if_failure 5 10 120 ua auto-attach || exit $ERR_AUTO_UA_ATTACH
+
+    echo "disabling ua livepatch..."
+    retrycmd_if_failure 5 10 300 echo y | ua disable livepatch
+}
+
+detachAndCleanUpUA() {
+    echo "detaching ua..."
+    retrycmd_if_failure 5 10 120 printf "y\nN" | ua detach || $ERR_UA_DETACH
+
+    # now that the ESM/FIPS packages are installed, clean up apt settings in the vhd,
+    # the VMs created on customers' subscriptions don't have access to UA repo
+    rm -f /etc/apt/trusted.gpg.d/ubuntu-advantage-esm-apps.gpg
+    rm -f /etc/apt/trusted.gpg.d/ubuntu-advantage-esm-infra-trusty.gpg
+    rm -f /etc/apt/trusted.gpg.d/ubuntu-advantage-fips.gpg
+    rm -f /etc/apt/sources.list.d/ubuntu-esm-apps.list
+    rm -f /etc/apt/sources.list.d/ubuntu-esm-infra.list
+    rm -f /etc/apt/sources.list.d/ubuntu-fips-updates.list
+    rm -f /etc/apt/auth.conf.d/*ubuntu-advantage
+    apt_get_update || exit $ERR_APT_UPDATE_TIMEOUT
 }

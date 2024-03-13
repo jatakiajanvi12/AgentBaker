@@ -1,7 +1,6 @@
 ﻿# NOTE: We do not log in this script since we do not have log rotation for the generated logs now.
 
 $Global:ClusterConfiguration = ConvertFrom-Json ((Get-Content "c:\k\kubeclusterconfig.json" -ErrorAction Stop) | out-string)
-$global:ContainerRuntime = $Global:ClusterConfiguration.Cri.Name
 $aksLogFolder="C:\WindowsAzure\Logs\aks"
 $isInitializing=$False
 $LogPath="c:\k\loggenerator.log"
@@ -81,10 +80,20 @@ $kLogFiles = @(
     "csi-proxy.err.log",
     "containerd.log",
     "containerd.err.log",
-    "hnsremediator.log"
+    "hnsremediator.log",
+    "windowslogscleanup.log"
 )
 $kLogFiles | Foreach-Object {
     Create-SymbolLinkFile -SrcFile (Join-Path "C:\k\" $_) -DestFile (Join-Path $aksLogFolder $_)
+}
+
+$nvidiaInstallLogFolder="C:\AzureData\NvidiaInstallLog"
+if (Test-Path $nvidiaInstallLogFolder) {
+    $logFiles=Get-ChildItem (Join-Path $nvidiaInstallLogFolder *.log)
+    $logFiles | Foreach-Object {
+        $fileName = [IO.Path]::GetFileName($_)
+        Create-SymbolLinkFile -SrcFile (Join-Path $nvidiaInstallLogFolder $fileName) -DestFile (Join-Path $aksLogFolder $fileName)
+    }
 }
 
 $calicoLogFolder="C:\CalicoWindows\logs\"

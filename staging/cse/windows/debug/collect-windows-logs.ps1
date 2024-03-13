@@ -1,6 +1,32 @@
 # NOTE: Please also update staging/cse/windows/provisioningscripts/loggenerator.ps1 when collecting new logs.
 $ProgressPreference = "SilentlyContinue"
 
+function CollectLogsFromDirectory {
+  Param(
+      [Parameter(Mandatory=$true)]
+      [String] $path,
+      [Parameter(Mandatory=$true)]
+      [String] $targetFileName
+  )
+  try {
+    $tempFile="$ENV:TEMP\$targetFileName"
+    if (Test-Path $path) {
+      Write-Host "Collecting logs from $path"
+      Compress-Archive -LiteralPath $path -DestinationPath $tempFile
+      # Compress-Archive will not generate any target file if the source directory is empty
+      if (Test-Path $tempFile) {
+        return $tempFile
+      }
+      Write-Host "Ignore since there is no log in $path"
+    } else {
+      Write-Host "Path $path does not exist"
+    }
+  } catch {
+    Write-Host "Failed to collect logs from $path"
+  }
+  return ""
+}
+
 $lockedFiles = @(
   "kubelet.err.log",
   "kubelet.log",
@@ -19,8 +45,14 @@ $lockedFiles = @(
 $timeStamp = get-date -format 'yyyyMMdd-hhmmss'
 $zipName = "$env:computername-$($timeStamp)_logs.zip"
 
+$paths = @() # All log file paths will be collected 
+
+# Log the script output. It is the first log file to avoid other impact.
+$outputLogFile = "$ENV:TEMP\collect-windows-logs-output.log"
+Start-Transcript -Path $outputLogFile
+$paths += $outputLogFile
+
 Write-Host "Collecting logs for various Kubernetes components"
-$paths = @()
 get-childitem c:\k\*.log* -Exclude $lockedFiles | Foreach-Object {
   $paths += $_
 }
@@ -77,7 +109,7 @@ $lockedFiles | Foreach-Object {
 }
 
 Write-Host "Exporting ETW events to CSV files"
-$scm = Get-WinEvent -FilterHashtable @{logname = 'System'; ProviderName = 'Service Control Manager' } | Where-Object { $_.Message -Like "*docker*" -or $_.Message -Like "*kub*" } | Select-Object -Property TimeCreated, Id, LevelDisplayName, Message
+$scm = Get-WinEvent -FilterHashtable @{logname = 'System'; ProviderName = 'Service Control Manager' } | Where-Object { $_.Message -Like "*containerd*" -or $_.Message -Like "*kub*" } | Select-Object -Property TimeCreated, Id, LevelDisplayName, Message
 # 2004 = resource exhaustion, other 5 events related to reboots
 $reboots = Get-WinEvent -ErrorAction Ignore -FilterHashtable @{logname = 'System'; id = 1074, 1076, 2004, 6005, 6006, 6008 } | Select-Object -Property TimeCreated, Id, LevelDisplayName, Message
 $crashes = Get-WinEvent -ErrorAction Ignore -FilterHashtable @{logname = 'Application'; ProviderName = 'Windows Error Reporting' } | Select-Object -Property TimeCreated, Id, LevelDisplayName, Message
@@ -85,13 +117,6 @@ $scm + $reboots + $crashes | Sort-Object TimeCreated | Export-CSV -Path "$ENV:TE
 $paths += "$ENV:TEMP\\$($timeStamp)_services.csv"
 Get-WinEvent -LogName Microsoft-Windows-Hyper-V-Compute-Operational | Select-Object -Property TimeCreated, Id, LevelDisplayName, Message | Sort-Object TimeCreated | Export-Csv -Path "$ENV:TEMP\\$($timeStamp)_hyper-v-compute-operational.csv"
 $paths += "$ENV:TEMP\\$($timeStamp)_hyper-v-compute-operational.csv"
-if ([System.Diagnostics.EventLog]::SourceExists("Docker")) {
-  get-eventlog -LogName Application -Source Docker | Select-Object Index, TimeGenerated, EntryType, Message | Sort-Object Index | Export-CSV -Path "$ENV:TEMP\\$($timeStamp)_docker.csv"
-  $paths += "$ENV:TEMP\\$($timeStamp)_docker.csv"
-}
-else {
-  Write-Host "Docker events are not available"
-}
 
 Write-Host "Collecting gMSAv2 related logs"
 # CCGPlugin (Windows gMSAv2)
@@ -275,6 +300,69 @@ if ($res) {
 else {
   Write-Host "vmcompute process not availabel"
 }
+
+# Collect dump files
+$tempFile=(CollectLogsFromDirectory -path "C:\ProgramData\Microsoft\Windows\WER" -targetFileName "WER-$($timeStamp).zip")
+if ($tempFile -ne "") {
+  $paths += $tempFile
+}
+$tempFile=(CollectLogsFromDirectory -path "C:\Windows\Minidump" -targetFileName "Minidump-$($timeStamp).zip")
+if ($tempFile -ne "") {
+  $paths += $tempFile
+}
+$tempFile=(CollectLogsFromDirectory -path "C:\Windows\SystemTemp" -targetFileName "SystemTemp-$($timeStamp).zip")
+if ($tempFile -ne "") {
+  $paths += $tempFile
+}
+
+$gpuTemp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.IO.Path]::GetRandomFileName())
+New-Item -Type Directory $gpuTemp
+
+$nvidiaInstallLogFolder="C:\AzureData\NvidiaInstallLog"
+if (Test-Path $nvidiaInstallLogFolder) {
+  $logFiles = Get-ChildItem (Join-Path $nvidiaInstallLogFolder *.log)
+  $logFiles | Foreach-Object {
+    Write-Host "Copying $_ to temp"
+    $tempFile = Copy-Item $_ $gpuTemp -Passthru -ErrorAction Ignore
+    if ($tempFile) {
+      $paths += $tempFile
+    }
+  }
+}
+
+if ((Test-Path "c:\k\kubectl.exe") -and (Test-Path "c:\k\config")) {
+  try {
+    Write-Host "Collecting the information of the node and pods by kubectl"
+    function kubectl { c:\k\kubectl.exe --kubeconfig c:\k\config $args }
+
+    $testResult = kubectl version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      throw "Failed to run kubectl, result: $testResult"
+    }
+
+    kubectl get nodes -o wide > "$ENV:TEMP\kubectl-get-nodes.log"
+    $paths += "$ENV:TEMP\kubectl-get-nodes.log"
+
+    $nodeName = $env:COMPUTERNAME.ToLower()
+    kubectl describe node $nodeName > "$ENV:TEMP\kubectl-describe-nodes.log"
+    $paths += "$ENV:TEMP\kubectl-describe-nodes.log"
+
+    "kubectl describe all pods on $nodeName" > "$ENV:TEMP\kubectl-describe-pods.log"
+    $podsJson = & crictl.exe pods --output json | ConvertFrom-Json
+    foreach ($pod in $podsJson.items) {
+      $podName = $pod.metadata.name
+      $namespace = $pod.metadata.namespace
+      kubectl describe pod $podName -n $namespace >> "$ENV:TEMP\kubectl-describe-pods.log" # append
+    }
+    $paths += "$ENV:TEMP\kubectl-describe-pods.log"
+  }
+  catch {
+    Write-Host "Error: $_"
+  }
+}
+
+Write-Host "All logs collected: $paths"
+Stop-Transcript
 
 Write-Host "Compressing all logs to $zipName"
 $paths | Format-Table FullName, Length -AutoSize

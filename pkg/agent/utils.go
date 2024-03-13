@@ -26,7 +26,8 @@ import (
 
 (if kubelet config file is enabled).
 */
-var TranslatedKubeletConfigFlags map[string]bool = map[string]bool{
+//nolint:gochecknoglobals
+var TranslatedKubeletConfigFlags = map[string]bool{
 	"--address":                           true,
 	"--anonymous-auth":                    true,
 	"--client-ca-file":                    true,
@@ -66,13 +67,9 @@ var TranslatedKubeletConfigFlags map[string]bool = map[string]bool{
 	"--container-log-max-files":           true,
 }
 
-var keyvaultSecretPathRe *regexp.Regexp
-
-func init() {
-	keyvaultSecretPathRe = regexp.MustCompile(`^(/subscriptions/\S+/resourceGroups/\S+/providers/Microsoft.KeyVault/vaults/\S+)/secrets/([^/\s]+)(/(\S+))?$`) //nolint:lll
-}
-
 type paramsMap map[string]interface{}
+
+const numInPair = 2
 
 func addValue(m paramsMap, k string, v interface{}) {
 	m[k] = paramsMap{
@@ -99,6 +96,7 @@ func addSecret(m paramsMap, k string, v interface{}, encode bool) {
 		addValue(m, k, v)
 		return
 	}
+	keyvaultSecretPathRe := regexp.MustCompile(`^(/subscriptions/\S+/resourceGroups/\S+/providers/Microsoft.KeyVault/vaults/\S+)/secrets/([^/\s]+)(/(\S+))?$`) //nolint:lll
 	parts := keyvaultSecretPathRe.FindStringSubmatch(str)
 	if parts == nil || len(parts) != 5 {
 		if encode {
@@ -179,6 +177,7 @@ func getBase64EncodedGzippedCustomScript(csFilename string, config *datamodel.No
 		panic(fmt.Sprintf("BUG: %s", err.Error()))
 	}
 	// translate the parameters.
+	b = removeComments(b)
 	templ := template.New("ContainerService template").Option("missingkey=error").Funcs(getContainerServiceFuncMap(config))
 	_, err = templ.Parse(string(b))
 	if err != nil {
@@ -186,17 +185,71 @@ func getBase64EncodedGzippedCustomScript(csFilename string, config *datamodel.No
 		panic(fmt.Sprintf("BUG: %s", err.Error()))
 	}
 	var buffer bytes.Buffer
-	templ.Execute(&buffer, config.ContainerService)
+	err = templ.Execute(&buffer, config.ContainerService)
+	if err != nil {
+		// this should never happen and this is a bug.
+		panic(fmt.Sprintf("BUG: %s", err.Error()))
+	}
 	csStr := buffer.String()
 	csStr = strings.ReplaceAll(csStr, "\r\n", "\n")
 	return getBase64EncodedGzippedCustomScriptFromStr(csStr)
+}
+
+// This is "best-effort" - removes MOST of the comments with obvious formats, to lower the space required by CustomData component.
+func removeComments(b []byte) []byte {
+	var contentWithoutComments []string
+	lines := strings.Split(string(b), "\n")
+	for _, line := range lines {
+		lineNoWhitespace := strings.TrimSpace(line)
+		if lineStartsWithComment(lineNoWhitespace) {
+			// ignore entire line that is a comment
+			continue
+		}
+		line = trimTrailingComment(line)
+		contentWithoutComments = append(contentWithoutComments, line)
+	}
+	return []byte(strings.Join(contentWithoutComments, "\n"))
+}
+
+func lineStartsWithComment(trimmedToCheck string) bool {
+	return strings.HasPrefix(trimmedToCheck, "# ") || strings.HasPrefix(trimmedToCheck, "##")
+}
+
+func trimTrailingComment(line string) string {
+	lastHashIndex := strings.LastIndex(line, "#")
+	if lastHashIndex > 0 && isCommentAtTheEndOfLine(lastHashIndex, line) && !lineLogsToOutput(line) {
+		// remove only the comment part from line
+		line = line[:lastHashIndex]
+	}
+	return line
+}
+
+func lineLogsToOutput(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "echo")
+}
+
+// Trying to avoid using a regex. There are certain patterns we ignore just to be on the safe side. This is enough to get rid of most of the obvious comments.
+func isCommentAtTheEndOfLine(lastHashIndex int, trimmedToCheck string) bool {
+	getSlice := func(start, end int, str string) string {
+		if end > len(str) || start > end {
+			return ""
+		}
+		return str[start:end]
+	}
+	// These are two of patterns that are present amongst Agent Baker files that we need to specifically check for. Non-exhaustive
+	tailingCommentSegmentLen := 2
+	return getSlice(lastHashIndex-1, lastHashIndex+1, trimmedToCheck) != "<#" && getSlice(lastHashIndex, lastHashIndex+tailingCommentSegmentLen, trimmedToCheck) == "# "
 }
 
 // getBase64EncodedGzippedCustomScriptFromStr will return a base64-encoded string of the gzip'd source data.
 func getBase64EncodedGzippedCustomScriptFromStr(str string) string {
 	var gzipB bytes.Buffer
 	w := gzip.NewWriter(&gzipB)
-	w.Write([]byte(str))
+	_, err := w.Write([]byte(str))
+	if err != nil {
+		// this should never happen and this is a bug.
+		panic(fmt.Sprintf("BUG: %s", err.Error()))
+	}
 	w.Close()
 	return base64.StdEncoding.EncodeToString(gzipB.Bytes())
 }
@@ -284,9 +337,10 @@ func GetOrderedKubeletConfigFlagString(k map[string]string, cs *datamodel.Contai
 	// Always force remove of dynamic-config-dir.
 	kubeletConfigFileEnabled := IsKubeletConfigFileEnabled(cs, profile, kubeletConfigFileToggleEnabled)
 	keys := []string{}
+	ommitedKubletConfigFlags := datamodel.GetCommandLineOmittedKubeletConfigFlags()
 	for key := range k {
 		if !kubeletConfigFileEnabled || !TranslatedKubeletConfigFlags[key] {
-			if !datamodel.CommandLineOmittedKubeletConfigFlags[key] {
+			if !ommitedKubletConfigFlags[key] {
 				keys = append(keys, key)
 			}
 		}
@@ -310,8 +364,9 @@ func getOrderedKubeletConfigFlagWithCustomConfigurationString(customConfig, defa
 	}
 
 	keys := []string{}
+	ommitedKubletConfigFlags := datamodel.GetCommandLineOmittedKubeletConfigFlags()
 	for key := range config {
-		if !datamodel.CommandLineOmittedKubeletConfigFlags[key] {
+		if !ommitedKubletConfigFlags[key] {
 			keys = append(keys, key)
 		}
 	}
@@ -350,8 +405,9 @@ func IsKubeletConfigFileEnabled(cs *datamodel.ContainerService, profile *datamod
 			IsKubernetesVersionGe(cs.Properties.OrchestratorProfile.OrchestratorVersion, "1.14.0"))
 }
 
-// IsKubeletClientTLSBootstrappingEnabled get if kubelet client TLS bootstrapping is enabled.
-func IsKubeletClientTLSBootstrappingEnabled(tlsBootstrapToken *string) bool {
+// IsTLSBootstrappingEnabledWithHardCodedToken returns true if the specified TLS bootstrap token is non-nil, meaning
+// we will use it to perform TLS bootstrapping.
+func IsTLSBootstrappingEnabledWithHardCodedToken(tlsBootstrapToken *string) bool {
 	return tlsBootstrapToken != nil
 }
 
@@ -403,7 +459,7 @@ func getAKSKubeletConfiguration(kc map[string]string) *datamodel.AKSKubeletConfi
 //nolint:gocognit
 func setCustomKubeletConfig(customKc *datamodel.CustomKubeletConfig,
 	kubeletConfig *datamodel.AKSKubeletConfiguration) {
-	if customKc != nil {
+	if customKc != nil { //nolint:nestif
 		if customKc.CPUManagerPolicy != "" {
 			kubeletConfig.CPUManagerPolicy = customKc.CPUManagerPolicy
 		}
@@ -536,7 +592,7 @@ func strKeyValToMap(str string, strDelim string, pairDelim string) map[string]st
 	pairs := strings.Split(str, strDelim)
 	for _, pairRaw := range pairs {
 		pair := strings.Split(pairRaw, pairDelim)
-		if len(pair) == 2 {
+		if len(pair) == numInPair {
 			key := strings.TrimSpace(pair[0])
 			val := strings.TrimSpace(pair[1])
 			m[key] = val
@@ -550,7 +606,7 @@ func strKeyValToMapBool(str string, strDelim string, pairDelim string) map[strin
 	pairs := strings.Split(str, strDelim)
 	for _, pairRaw := range pairs {
 		pair := strings.Split(pairRaw, pairDelim)
-		if len(pair) == 2 {
+		if len(pair) == numInPair {
 			key := strings.TrimSpace(pair[0])
 			val := strings.TrimSpace(pair[1])
 			m[key] = strToBool(val)

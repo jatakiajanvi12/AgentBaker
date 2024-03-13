@@ -1,66 +1,46 @@
 SHELL=/bin/bash -o pipefail
 
 build-packer:
-ifeq (${OS_SKU},Ubuntu)
+ifeq (${MODE},linuxVhdMode)
+	@echo "${MODE}: Generating prefetch scripts"
+	@bash -c "pushd vhdbuilder/prefetch; go run main.go --components=../packer/components.json --container-image-prefetch-script=../packer/prefetch.sh; popd"
+endif
 ifeq (${ARCHITECTURE},ARM64)
-ifeq (${HYPERV_GENERATION},V2)
 	@echo "${MODE}: Building with Hyper-v generation 2 ARM64 VM"
+ifeq (${OS_SKU},Ubuntu)
 	@echo "Using packer template file vhd-image-builder-arm64-gen2.json"
 	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-arm64-gen2.json
-	@echo "${MODE}: Convert os disk snapshot to SIG"
-	@./vhdbuilder/packer/convert-osdisk-snapshot-to-sig.sh
-endif
-else
-ifeq (${HYPERV_GENERATION},V2)
-	@echo "${MODE}: Building with Hyper-v generation 2 VM"
-else
-	@echo "${MODE}: Building with Hyper-v generation 1 VM"
-endif
-	@echo "Using packer template file: vhd-image-builder-base.json"
-	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-base.json
-endif
 else ifeq (${OS_SKU},CBLMariner)
-ifeq (${OS_VERSION},V1)
-ifeq (${HYPERV_GENERATION},V2)
-	@echo "${MODE}: Building with Hyper-v generation 2 VM"
-	@echo "Using packer template file vhd-image-builder-mariner-gen2.json"
-	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-mariner-gen2.json
-else
-	@echo "${MODE}: Building with Hyper-v generation 1 VM"
-	@echo "Using packer template file vhd-image-builder-mariner.json"
-	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-mariner.json
-endif
-else ifeq (${OS_VERSION},V2)
-ifeq (${ARCHITECTURE}, ARM64)
-ifeq (${HYPERV_GENERATION},V2)
-	@echo "${MODE}: Building with Hyper-v generation 2 ARM64 VM"
-	@echo "Using packer template file vhd-image-builder-mariner2-arm64.json"
-	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-mariner2-arm64.json
-	@echo "${MODE}: Convert os disk snapshot to SIG"
-	@./vhdbuilder/packer/convert-osdisk-snapshot-to-sig.sh
-endif
-else
-ifeq (${HYPERV_GENERATION},V2)
-	@echo "${MODE}: Building with Hyper-v generation 2 VM"
-	@echo "Using packer template file vhd-image-builder-mariner2-gen2.json"
-	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-mariner2-gen2.json
-else
-	@echo "${MODE}: Building with Hyper-v generation 1 VM"
-	@echo "Using packer template file vhd-image-builder-mariner2-gen2.json"
-	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-mariner2-gen2.json
-endif
-endif
-else ifeq (${OS_VERSION},V2kata)
-ifeq (${HYPERV_GENERATION},V2)
-	@echo "${MODE}: Building with Hyper-v generation 2 VM for kata"
-	@echo "Using packer template file vhd-image-builder-mariner2-gen2-kata.json"
-	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-mariner2-gen2-kata.json
-endif
-else
-	$(error OS_VERSION was invalid ${OS_VERSION})
-endif
+	@echo "Using packer template file vhd-image-builder-mariner-arm64.json"
+	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-mariner-arm64.json
+else ifeq (${OS_SKU},AzureLinux)
+	@echo "Using packer template file vhd-image-builder-mariner-arm64.json"
+	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-mariner-arm64.json
 else
 	$(error OS_SKU was invalid ${OS_SKU})
+endif
+	@echo "${MODE}: Convert os disk snapshot to SIG"
+	@./vhdbuilder/packer/convert-osdisk-snapshot-to-sig.sh
+else ifeq (${ARCHITECTURE},X86_64)
+ifeq (${HYPERV_GENERATION},V2)
+	@echo "${MODE}: Building with Hyper-v generation 2 x86_64 VM"
+else ifeq (${HYPERV_GENERATION},V1)
+	@echo "${MODE}: Building with Hyper-v generation 1 X86_64 VM"
+else
+	$(error HYPERV_GENERATION was invalid ${HYPERV_GENERATION})
+endif
+ifeq (${OS_SKU},Ubuntu)
+	@echo "Using packer template file: vhd-image-builder-base.json"
+	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-base.json
+else ifeq (${OS_SKU},CBLMariner)
+	@echo "Using packer template file vhd-image-builder-mariner.json"
+	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-mariner.json
+else ifeq (${OS_SKU},AzureLinux)
+	@echo "Using packer template file vhd-image-builder-mariner.json"
+	@packer build -var-file=vhdbuilder/packer/settings.json vhdbuilder/packer/vhd-image-builder-mariner.json
+else
+	$(error OS_SKU was invalid ${OS_SKU})
+endif
 endif
 
 build-packer-windows:
@@ -82,13 +62,15 @@ endif
 endif
 
 az-login:
-ifeq (${OS_TYPE},Windows)
-	@echo "Logging into Azure with service principal..."
-	@az login --service-principal -u ${CLIENT_ID} -p ${CLIENT_SECRET} --tenant ${TENANT_ID}
-else
 	@echo "Logging into Azure with agent VM MSI..."
+ifeq ($(origin MANAGED_IDENTITY_ID), undefined)
+	@echo "Logging in with Hosted Pool's Default Managed Identity"
 	@az login --identity
+else
+	@echo "Logging in with Hosted Pool's Managed Identity: ${MANAGED_IDENTITY_ID}"
+	@az login --identity --username ${MANAGED_IDENTITY_ID}
 endif
+	@echo "Using the subscription ${SUBSCRIPTION_ID}"
 	@az account set -s ${SUBSCRIPTION_ID}
 
 init-packer:
@@ -98,7 +80,7 @@ run-packer: az-login
 	@packer version && ($(MAKE) -f packer.mk init-packer | tee packer-output) && ($(MAKE) -f packer.mk build-packer | tee -a packer-output)
 
 run-packer-windows: az-login
-	@packer version && ($(MAKE) -f packer.mk init-packer | tee packer-output) && ($(MAKE) -f packer.mk build-packer-windows | tee -a packer-output)
+	@packer init ./vhdbuilder/packer/packer-plugin.pkr.hcl && packer version && ($(MAKE) -f packer.mk init-packer | tee packer-output) && ($(MAKE) -f packer.mk build-packer-windows | tee -a packer-output)
 
 cleanup: az-login
 	@./vhdbuilder/packer/cleanup.sh
@@ -112,9 +94,6 @@ generate-sas: az-login
 
 convert-sig-to-classic-storage-account-blob: az-login
 	@./vhdbuilder/packer/convert-sig-to-classic-storage-account-blob.sh
-
-windows-vhd-publishing-info: az-login
-	@./vhdbuilder/packer/generate-windows-vhd-publishing-info.sh
 
 test-building-vhd: az-login
 	@./vhdbuilder/packer/test/run-test.sh

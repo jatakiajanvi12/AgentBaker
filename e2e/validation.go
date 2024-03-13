@@ -5,10 +5,28 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"testing"
 
 	"github.com/Azure/agentbakere2e/scenario"
 )
+
+func validateNodeHealth(ctx context.Context, kube *kubeclient, vmssName string) (string, error) {
+	nodeName, err := waitUntilNodeReady(ctx, kube, vmssName)
+	if err != nil {
+		return "", fmt.Errorf("error waiting for node ready: %w", err)
+	}
+
+	nginxPodName, err := ensureTestNginxPod(ctx, kube, nodeName)
+	if err != nil {
+		return "", fmt.Errorf("error waiting for pod ready: %w", err)
+	}
+
+	err = waitUntilPodDeleted(ctx, kube, nginxPodName)
+	if err != nil {
+		return "", fmt.Errorf("error waiting pod deleted: %w", err)
+	}
+
+	return nodeName, nil
+}
 
 func validateWasm(ctx context.Context, kube *kubeclient, nodeName, privateKey string) error {
 	spinPodName, err := ensureWasmPods(ctx, kube, nodeName)
@@ -62,8 +80,8 @@ func validateWasm(ctx context.Context, kube *kubeclient, nodeName, privateKey st
 	return nil
 }
 
-func runLiveVMValidators(ctx context.Context, t *testing.T, vmssName, privateIP, sshPrivateKey string, opts *scenarioRunOpts) error {
-	podName, err := getDebugPodName(opts.kube)
+func runLiveVMValidators(ctx context.Context, vmssName, privateIP, sshPrivateKey string, opts *scenarioRunOpts) error {
+	podName, err := getDebugPodName(opts.clusterConfig.kube)
 	if err != nil {
 		return fmt.Errorf("unable to get debug pod name: %w", err)
 	}
@@ -76,20 +94,16 @@ func runLiveVMValidators(ctx context.Context, t *testing.T, vmssName, privateIP,
 	for _, validator := range validators {
 		desc := validator.Description
 		command := validator.Command
+		isShellBuiltIn := validator.IsShellBuiltIn
 		log.Printf("running live VM validator: %q", desc)
 
-		execResult, err := pollExecOnVM(ctx, opts.kube, privateIP, podName, sshPrivateKey, command)
+		execResult, err := pollExecOnVM(ctx, opts.clusterConfig.kube, privateIP, podName, sshPrivateKey, command, isShellBuiltIn)
 		if err != nil {
 			return fmt.Errorf("unable to execute validator command %q: %w", command, err)
 		}
 
-		if execResult.exitCode != "0" {
-			execResult.dumpAll()
-			return fmt.Errorf("validator command %q terminated with exit code %s", command, execResult.exitCode)
-		}
-
 		if validator.Asserter != nil {
-			err := validator.Asserter(execResult.stdout.String(), execResult.stderr.String())
+			err := validator.Asserter(execResult.exitCode, execResult.stdout.String(), execResult.stderr.String())
 			if err != nil {
 				execResult.dumpAll()
 				return fmt.Errorf("failed validator assertion: %w", err)
@@ -105,7 +119,10 @@ func commonLiveVMValidators() []*scenario.LiveVMValidator {
 		{
 			Description: "assert /etc/default/kubelet should not contain dynamic config dir flag",
 			Command:     "cat /etc/default/kubelet",
-			Asserter: func(stdout, stderr string) error {
+			Asserter: func(code, stdout, stderr string) error {
+				if code != "0" {
+					return fmt.Errorf("validator command terminated with exit code %q but expected code 0", code)
+				}
 				if strings.Contains(stdout, "--dynamic-config-dir") {
 					return fmt.Errorf("/etc/default/kubelet should not contain kubelet flag '--dynamic-config-dir', but does")
 				}
@@ -113,15 +130,15 @@ func commonLiveVMValidators() []*scenario.LiveVMValidator {
 			},
 		},
 		scenario.SysctlConfigValidator(
-			map[string]int{
-				"net.ipv4.tcp_retries2":             8,
-				"net.core.message_burst":            80,
-				"net.core.message_cost":             40,
-				"net.core.somaxconn":                16384,
-				"net.ipv4.tcp_max_syn_backlog":      16384,
-				"net.ipv4.neigh.default.gc_thresh1": 4096,
-				"net.ipv4.neigh.default.gc_thresh2": 8192,
-				"net.ipv4.neigh.default.gc_thresh3": 16384,
+			map[string]string{
+				"net.ipv4.tcp_retries2":             "8",
+				"net.core.message_burst":            "80",
+				"net.core.message_cost":             "40",
+				"net.core.somaxconn":                "16384",
+				"net.ipv4.tcp_max_syn_backlog":      "16384",
+				"net.ipv4.neigh.default.gc_thresh1": "4096",
+				"net.ipv4.neigh.default.gc_thresh2": "8192",
+				"net.ipv4.neigh.default.gc_thresh3": "16384",
 			},
 		),
 		scenario.DirectoryValidator(

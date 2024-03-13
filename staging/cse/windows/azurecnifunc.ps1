@@ -8,6 +8,8 @@ function Install-VnetPlugins
         [Parameter(Mandatory=$true)][string]
         $VNetCNIPluginsURL
     )
+    Logs-To-Event -TaskName "AKS.WindowsCSE.InstallVnetPlugins" -TaskMessage "Start to install Azure VNet plugins. VnetCNIPluginsURL: $global:VNetCNIPluginsURL"
+
     # Create CNI directories.
     Create-Directory -FullPath $AzureCNIBinDir -DirectoryUsage "storing Azure CNI binaries"
     Create-Directory -FullPath $AzureCNIConfDir -DirectoryUsage "storing Azure CNI configuration"
@@ -43,6 +45,8 @@ function Set-AzureCNIConfig
         [Parameter(Mandatory=$false)][bool]
         $IsAzureCNIOverlayEnabled
     )
+    Logs-To-Event -TaskName "AKS.WindowsCSE.SetAzureCNIConfig" -TaskMessage "Start to set Azure CNI config. IsDualStackEnabled: $global:IsDualStackEnabled, IsAzureCNIOverlayEnabled: $global:IsAzureCNIOverlayEnabled, IsDisableWindowsOutboundNat: $global:IsDisableWindowsOutboundNat"
+
     $fileName  = [Io.path]::Combine("$AzureCNIConfDir", "10-azure.conflist")
     $configJson = Get-Content $fileName | ConvertFrom-Json
     $configJson.plugins.dns.Nameservers[0] = $KubeDnsServiceIp
@@ -62,23 +66,39 @@ function Set-AzureCNIConfig
             Value = $valueObj
         }
 
-        # $configJson.plugins[0].AdditionalArgs[0] is OutboundNAT. Replace OutBoundNAT with LoopbackDSR for IMDS.
+        # $configJson.plugins[0].AdditionalArgs[0] is OutboundNAT.
+        Write-Log "Replace OutBoundNAT with LoopbackDSR for IMDS acess."
         $configJson.plugins[0].AdditionalArgs[0] = $jsonContent
 
-        # TODO: Remove it after Windows OS fixes the issue.
-        Write-Log "Update RegKey to disable the incompatible HNSControlFlag (0x10) for feature DisableWindowsOutboundNat"
-        $hnsControlFlag=0x10
-        $currentValue=(Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name HNSControlFlag -ErrorAction Ignore)
-        if (![string]::IsNullOrEmpty($currentValue)) {
-            Write-Log "The current value of HNSControlFlag is $currentValue"
-            # Set the bit to 0 if the bit is 1
-            if ([int]$currentValue.HNSControlFlag -band $hnsControlFlag) {
-                $hnsControlFlag=([int]$currentValue.HNSControlFlag -bxor $hnsControlFlag)
-                Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name HNSControlFlag -Type DWORD -Value $hnsControlFlag
+        # Update the corresponding system regkey for DisableWindowsOutboundNat feature.
+        $osVersion = Get-WindowsVersion
+        if ($osVersion -eq "1809"){
+            Write-Log "Update RegKey to disable the incompatible HNSControlFlag (0x10) for feature DisableWindowsOutboundNat"
+            $hnsControlFlag=0x10
+            $currentValue=(Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name HNSControlFlag -ErrorAction Ignore)
+            if (![string]::IsNullOrEmpty($currentValue)) {
+                Write-Log "The current value of HNSControlFlag is $currentValue"
+                # Set the bit to 0 if the bit is 1
+                if ([int]$currentValue.HNSControlFlag -band $hnsControlFlag) {
+                    $hnsControlFlag=([int]$currentValue.HNSControlFlag -bxor $hnsControlFlag)
+                    Write-Log "HNSControlFlag is updated to $hnsControlFlag to clear the bit 0x10"
+                    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name HNSControlFlag -Type DWORD -Value $hnsControlFlag
+                }
+            } else {
+                # Set 0 to disable all features under HNSControlFlag (0x10 defaults enable)
+                Write-Log "HNSControlFlag is set to 0 to clear the bit 0x10"
+                Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name HNSControlFlag -Type DWORD -Value 0
             }
-        } else {
-            # Set 0 to disable all features under HNSControlFlag (0x10 defaults enable)
-            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name HNSControlFlag -Type DWORD -Value 0
+        } elseif ($osVersion -eq "ltsc2022") {
+            Write-Log "SourcePortPreservationForHostPort is set to 0"
+            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State" -Name SourcePortPreservationForHostPort -Type DWORD -Value 0
+        }
+        # Restart hns service if it is exsting and running, to make the system regkey change effective.
+        $hnsServiceName = 'hns'
+        $hnsService = Get-Service -Name $hnsServiceName -ErrorAction SilentlyContinue
+        if ($hnsService -and $hnsService.Status -eq 'Running') {
+            Write-Log "hns service is already running. Restart hns."
+            Restart-Service -Name $hnsServiceName
         }
     } else {
         # Fill in DNS information for kubernetes.
@@ -99,8 +119,8 @@ function Set-AzureCNIConfig
             }
         }
 
-        $osBuildNumber = (get-wmiobject win32_operatingsystem).BuildNumber
-        if ($osBuildNumber -le 17763){
+        $osVersion = Get-WindowsVersion
+        if ($osVersion -eq "1809"){
             # In WS2019 and below rules in the exception list are generated by dropping the prefix lenght and removing duplicate rules.
             # If multiple execptions are specified with different ranges we should only include the broadest range for each address.
             # This issue has been addressed in 19h1+ builds
@@ -108,8 +128,7 @@ function Set-AzureCNIConfig
             $processedExceptions = GetBroadestRangesForEachAddress $exceptionAddresses
             Write-Log "Filtering CNI config exception list values to work around WS2019 issue processing rules. Original exception list: $exceptionAddresses, processed exception list: $processedExceptions"
             $configJson.plugins.AdditionalArgs[0].Value.ExceptionList = $processedExceptions
-        }
-        else {
+        } else {
             if ($IsDualStackEnabled) {
                 $ipv4Cidrs = @()
                 $ipv6Cidrs = @()
@@ -282,6 +301,7 @@ function GenerateAzureStackCNIConfig
         [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string] $KubeDir
 
     )
+    Logs-To-Event -TaskName "AKS.WindowsCSE.GenerateAzureStackCNIConfig" -TaskMessage "Start to generate Azure Stack CNI config"
 
     $networkInterfacesFile = "$KubeDir\network-interfaces.json"
     $azureCNIConfigFile = "$KubeDir\interfaces.json"
@@ -378,10 +398,12 @@ function New-ExternalHnsNetwork
         [Parameter(Mandatory=$true)][bool]
         $IsDualStackEnabled
     )
+    Logs-To-Event -TaskName "AKS.WindowsCSE.NewExternalHnsNetwork" -TaskMessage "Start to create new external hns network"
 
     Write-Log "Creating new HNS network `"ext`""
     $externalNetwork = "ext"
     $nas = @(Get-NetAdapter -Physical)
+    $nodeIPs = @()
 
     if ($nas.Count -eq 0) {
         Set-ExitCode -ExitCode $global:WINDOWS_CSE_ERROR_NETWORK_ADAPTER_NOT_EXIST -ErrorMessage "Failed to find any physical network adapters"
@@ -395,6 +417,36 @@ function New-ExternalHnsNetwork
         {
             $managementIP = $netIP.IPAddress
             $adapterName = $na.Name
+
+            Write-Log "Get node IPv4 address assigned to the adapter $($na.Name): $($managementIP)"
+            $nodeIPs += $managementIP
+
+            if ($IsDualStackEnabled) {
+                $netIPv6s = Get-NetIPAddress -ifIndex $na.ifIndex -AddressFamily IPv6 -ErrorAction SilentlyContinue -ErrorVariable netIPErr
+                foreach($ipv6 in $netIPv6s)
+                {
+                    # On an Azure Windows VM, there are two IPv6 IP addresses. Below is an example. It is same in an Azure Linux VM.
+                    # ifIndex IPAddress                                       PrefixLength PrefixOrigin SuffixOrigin AddressState PolicyStore
+                    # ------- ---------                                       ------------ ------------ ------------ ------------ -----------
+                    # 6       fe80::97bd:baf7:2853:f73d%6                               64 WellKnown    Link         Preferred    ActiveStore
+                    # 6       2404:f800:8000:122::4                                    128 Dhcp         Dhcp         Preferred    ActiveStore
+                    #
+                    # From the found docuements. fe80: with WellKnown is the link-local address so we should ignore it.
+                    # IPv6 link-local is a special type of unicast address that is auto-configured on any interface using a combination of 
+                    # the link-local prefix FE80::/10 (first 10 bits equal to 1111 1110 10) and the MAC address of the interface.
+                    #
+                    # https://learn.microsoft.com/en-us/dotnet/api/system.net.networkinformation.prefixorigin?view=net-8.0
+                    # WellKnown | 2 | The prefix is a well-known prefix. Well-known prefixes are specified in standard-track Request for 
+                    # Comments (RFC) documents and assigned by the Internet Assigned Numbers Authority (Iana) or an address registry. Such 
+                    # prefixes are reserved for special purposes. -- | -- | --
+                    if ($ipv6.PrefixOrigin -ne "WellKnown")
+                    {
+                        Write-Log "Get node IPv6 address assigned to the adapter $($na.Name): $($ipv6.IPAddress)"
+                        $nodeIPs += $ipv6.IPAddress
+                    }
+                }
+            }
+
             break
         }
         else {
@@ -409,6 +461,24 @@ function New-ExternalHnsNetwork
     if(-Not $managementIP)
     {
         Set-ExitCode -ExitCode $global:WINDOWS_CSE_ERROR_NOT_FOUND_MANAGEMENT_IP -ErrorMessage "None of the physical network adapters has an IP address"
+    }
+
+    # https://github.com/kubernetes/kubernetes/pull/121028
+    if (([version]$global:KubeBinariesVersion).CompareTo([version]("1.29.0")) -ge 0) {
+        Logs-To-Event -TaskName "AKS.WindowsCSE.UpdateKubeClusterConfig" -TaskMessage "Start to update KubeCluster Config. NodeIPs: $nodeIPs"
+
+        # It should always get ipv4 address. Otherwise, it will throw WINDOWS_CSE_ERROR_NOT_FOUND_MANAGEMENT_IP
+        if ($IsDualStackEnabled -and $nodeIPs.Count -eq 1) {
+            Set-ExitCode -ExitCode $global:WINDOWS_CSE_ERROR_GET_NODE_IPV6_IP -ErrorMessage "Failed to get node IPv6 IP address"
+        }
+
+        try {
+            $clusterConfiguration = ConvertFrom-Json ((Get-Content $global:KubeClusterConfigPath -ErrorAction Stop) | Out-String)
+            $clusterConfiguration.Kubernetes.Kubelet.ConfigArgs += "--node-ip=$($nodeIPs -join ',')"
+            $clusterConfiguration | ConvertTo-Json -Depth 10 | Out-File -FilePath $global:KubeClusterConfigPath
+        } catch {
+            Set-ExitCode -ExitCode $global:WINDOWS_CSE_ERROR_UPDATING_KUBE_CLUSTER_CONFIG -ErrorMessage "Failed in updating kube cluster config. Error: $_"
+        }
     }
 
     Write-Log "Using adapter $adapterName with IP address $managementIP"
@@ -454,8 +524,8 @@ function Get-HnsPsm1
         [Parameter(Mandatory=$true)][string]
         $HNSModule
     )
+    Logs-To-Event "ASK.WindowsCSE.GetAndImportHNSModule" -TaskMessage "Start to get and import hns module. NetworkPlugin: $global:NetworkPlugin"
 
-    # HNSModule is C:\k\hns.psm1 when container runtime is Docker
     # HNSModule is C:\k\hns.v2.psm1 when container runtime is Containerd
     $fileName = [IO.Path]::GetFileName($HNSModule)
     # Get-LogCollectionScripts will copy hns module file to C:\k\debug

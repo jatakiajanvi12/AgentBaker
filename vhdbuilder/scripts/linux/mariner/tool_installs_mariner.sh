@@ -14,6 +14,12 @@ installBcc() {
     dnf_install 120 5 25 bcc-examples || exit $ERR_BCC_INSTALL_TIMEOUT
 }
 
+installBpftrace() {
+    echo "Installing bpftrace ..."
+    dnf_makecache || exit $ERR_APT_UPDATE_TIMEOUT
+    dnf_install 120 5 25 bpftrace || exit $ERR_BCC_INSTALL_TIMEOUT
+}
+
 addMarinerNvidiaRepo() {
     if [[ $OS_VERSION == "2.0" ]]; then 
         MARINER_NVIDIA_REPO_FILEPATH="/etc/yum.repos.d/mariner-nvidia.repo"
@@ -64,6 +70,7 @@ if [[ $OS_VERSION == "2.0" ]]; then
     cat << EOF >> ${CONFIG_FILEPATH}
 
     [DHCPv4]
+    UseDomains=true
     SendRelease=false
 EOF
 fi
@@ -87,6 +94,16 @@ disableDNFAutomatic() {
     systemctl stop dnf-automatic-install.timer || exit 1
     systemctl disable dnf-automatic-install.timer || exit 1
     systemctl mask dnf-automatic-install.timer || exit 1
+}
+
+disableTimesyncd() {
+    # Disable and Mask timesyncd to prevent it from interfering with chronyd's work
+    systemctl stop systemd-timesyncd || exit 1
+    systemctl disable systemd-timesyncd || exit 1
+    systemctl mask systemd-timesyncd || exit 1
+    
+    # Before we return, make sure that chronyd is running
+    systemctlEnableAndStart chronyd || exit $ERR_SYSTEMCTL_START_FAIL
 }
 
 # Regardless of UU mode, ensure check-restart is running
@@ -126,12 +143,16 @@ EOF
 }
 
 enableMarinerKata() {
-    # Enable the mshv boot path
-    sudo sed -i -e 's@menuentry "CBL-Mariner"@menuentry "Dom0" {\n    search --no-floppy --set=root --file /EFI/Microsoft/Boot/bootmgfw.efi\n        chainloader /EFI/Microsoft/Boot/bootmgfw.efi\n}\n\nmenuentry "CBL-Mariner"@'  /boot/grub2/grub.cfg
+    echo "Contents of blkid output"
+    my_blkid=$(blkid)
+    export my_blkid
+    echo $my_blkid
 
-    # kata-osbuilder-generate is responsible for triggering the kata-osbuilder.sh script, which uses
-    # dracut to generate an initrd for the nested VM using binaries from the Mariner host OS.
-    systemctlEnableAndStart kata-osbuilder-generate
+    boot_uuid=$(sudo grep -o -m 1 '[0-9a-f]\{8\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{4\}-[0-9a-f]\{12\}' /boot/efi/boot/grub2/grub.cfg)
+    export boot_uuid
+
+    sudo sed -i -e 's@load_env -f \$bootprefix\/mariner.cfg@load_env -f \$bootprefix\/mariner-mshv.cfg\nload_env -f $bootprefix\/mariner.cfg\n@'  /boot/grub2/grub.cfg
+    sudo sed -i -e 's@menuentry "CBL-Mariner"@menuentry "Dom0" {\n    search --no-floppy --set=root --file /HvLoader.efi\n    chainloader /HvLoader.efi lxhvloader.dll MSHV_ROOT=\\\\Windows MSHV_ENABLE=TRUE MSHV_SCHEDULER_TYPE=ROOT MSHV_X2APIC_POLICY=ENABLE MSHV_SEV_SNP=TRUE MSHV_LOAD_OPTION=INCLUDETRACEMETADATA=1\n    boot\n    search --no-floppy --fs-uuid '"$boot_uuid"' --set=root\n    linux $bootprefix/$mariner_linux_mshv $mariner_cmdline_mshv $systemd_cmdline root=$rootdevice\n    if [ -f $bootprefix/$mariner_initrd_mshv ]; then\n    initrd $bootprefix/$mariner_initrd_mshv\n    fi\n}\n\nmenuentry "CBL-Mariner"@'  /boot/grub2/grub.cfg
 }
 
 activateNfConntrack() {

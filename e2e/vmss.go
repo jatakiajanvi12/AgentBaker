@@ -8,7 +8,9 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
 	mrand "math/rand"
+	"testing"
 
 	"github.com/Azure/agentbakere2e/scenario"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
@@ -17,45 +19,50 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// Returns a newly generated RSA public/private key pair with the private key in PEM format.
-func getNewRSAKeyPair(r *mrand.Rand) (privatePEMBytes []byte, publicKeyBytes []byte, e error) {
-	privateKey, err := rsa.GenerateKey(r, 4096)
+const (
+	vmssNameTemplate                         = "abtest%s"
+	listVMSSNetworkInterfaceURLTemplate      = "https://management.azure.com/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Compute/virtualMachineScaleSets/%s/virtualMachines/%d/networkInterfaces?api-version=2018-10-01"
+	loadBalancerBackendAddressPoolIDTemplate = "/subscriptions/%s/resourceGroups/%s/providers/Microsoft.Network/loadBalancers/kubernetes/backendAddressPools/aksOutboundBackendPool"
+)
+
+func bootstrapVMSS(ctx context.Context, t *testing.T, r *mrand.Rand, vmssName string, opts *scenarioRunOpts, publicKeyBytes []byte) (*armcompute.VirtualMachineScaleSet, func(), error) {
+	nodeBootstrapping, err := getNodeBootstrapping(ctx, opts.nbc)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create rsa private key: %w", err)
+		return nil, nil, fmt.Errorf("unable to get node bootstrapping: %w", err)
 	}
 
-	err = privateKey.Validate()
+	cleanupVMSS := func() {
+		log.Printf("deleting vmss %q", vmssName)
+		if _, err := pollVMSSOperation(ctx, vmssName, pollVMSSOperationOpts{
+			pollingInterval: to.Ptr(deleteVMSSPollInterval),
+			pollingTimeout:  to.Ptr(deleteVMSSPollingTimeout),
+		}, func() (Poller[armcompute.VirtualMachineScaleSetsClientDeleteResponse], error) {
+			return opts.cloud.vmssClient.BeginDelete(ctx, *opts.clusterConfig.cluster.Properties.NodeResourceGroup, vmssName, nil)
+		}); err != nil {
+			t.Errorf("encountered an error while waiting for deletion of vmss %q: %s", vmssName, err)
+		}
+		log.Printf("finished deleting vmss %q", vmssName)
+	}
+
+	vmssModel, err := createVMSSWithPayload(ctx, nodeBootstrapping.CustomData, nodeBootstrapping.CSE, vmssName, publicKeyBytes, opts)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to validate rsa private key: %w", err)
+		return nil, cleanupVMSS, fmt.Errorf("unable to create VMSS with payload: %w", err)
 	}
 
-	publicRsaKey, err := ssh.NewPublicKey(&privateKey.PublicKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to convert private to public key: %w", err)
-	}
-
-	publicKeyBytes = ssh.MarshalAuthorizedKey(publicRsaKey)
-
-	// Get ASN.1 DER format
-	privDER := x509.MarshalPKCS1PrivateKey(privateKey)
-
-	// pem.Block
-	privBlock := pem.Block{
-		Type:    "RSA PRIVATE KEY",
-		Headers: nil,
-		Bytes:   privDER,
-	}
-
-	// Private key in PEM format
-	privatePEMBytes = pem.EncodeToMemory(&privBlock)
-
-	return
+	return vmssModel, cleanupVMSS, nil
 }
 
 func createVMSSWithPayload(ctx context.Context, customData, cseCmd, vmssName string, publicKeyBytes []byte, opts *scenarioRunOpts) (*armcompute.VirtualMachineScaleSet, error) {
-	model := getBaseVMSSModel(vmssName, opts.suiteConfig.location, *opts.chosenCluster.Properties.NodeResourceGroup, opts.subnetID, string(publicKeyBytes), customData, cseCmd)
+	model := getBaseVMSSModel(vmssName, string(publicKeyBytes), customData, cseCmd, opts)
 
-	isAzureCNI, err := opts.isChosenClusterAzureCNI()
+	if opts.suiteConfig.BuildID != "" {
+		if model.Tags == nil {
+			model.Tags = map[string]*string{}
+		}
+		model.Tags[buildIDTagKey] = &opts.suiteConfig.BuildID
+	}
+
+	isAzureCNI, err := opts.clusterConfig.isAzureCNI()
 	if err != nil {
 		return nil, fmt.Errorf("failed to determine whether chosen cluster uses Azure CNI from cluster model: %w", err)
 	}
@@ -66,24 +73,29 @@ func createVMSSWithPayload(ctx context.Context, customData, cseCmd, vmssName str
 		}
 	}
 
-	if opts.scenario.VMConfigMutator != nil {
-		opts.scenario.VMConfigMutator(&model)
+	if err := opts.scenario.PrepareVMSSModel(&model); err != nil {
+		return nil, fmt.Errorf("unable to prepare model for VMSS %q: %w", vmssName, err)
 	}
 
-	pollerResp, err := opts.cloud.vmssClient.BeginCreateOrUpdate(
-		ctx,
-		*opts.chosenCluster.Properties.NodeResourceGroup,
-		vmssName,
-		model,
-		nil,
-	)
-	if err != nil {
-		return nil, err
-	}
+	createVMSSCtx, cancel := context.WithTimeout(ctx, vmssClientCreateVMSSPollingTimeout)
+	defer cancel()
 
-	vmssResp, err := pollerResp.PollUntilDone(ctx, nil)
+	vmssResp, err := pollVMSSOperation(createVMSSCtx, vmssName, pollVMSSOperationOpts{
+		pollUntilDone: &runtime.PollUntilDoneOptions{
+			Frequency: vmssClientCreateVMSSPollInterval,
+		},
+	},
+		func() (Poller[armcompute.VirtualMachineScaleSetsClientCreateOrUpdateResponse], error) {
+			return opts.cloud.vmssClient.BeginCreateOrUpdate(
+				ctx,
+				*opts.clusterConfig.cluster.Properties.NodeResourceGroup,
+				vmssName,
+				model,
+				nil,
+			)
+		})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to create VMSS %q: %w", vmssName, err)
 	}
 
 	return &vmssResp.VirtualMachineScaleSet, nil
@@ -93,7 +105,7 @@ func createVMSSWithPayload(ctx context.Context, customData, cseCmd, vmssName str
 // as we need be able to allow AKS to allocate an additional IP config for each pod running on the given node.
 // Additional info: https://learn.microsoft.com/en-us/azure/aks/configure-azure-cni
 func addPodIPConfigsForAzureCNI(vmss *armcompute.VirtualMachineScaleSet, vmssName string, opts *scenarioRunOpts) error {
-	maxPodsPerNode, err := opts.chosenClusterMaxPodsPerNode()
+	maxPodsPerNode, err := opts.clusterConfig.maxPodsPerNode()
 	if err != nil {
 		return fmt.Errorf("failed to read agentpool MaxPods value from chosen cluster model: %w", err)
 	}
@@ -104,7 +116,7 @@ func addPodIPConfigsForAzureCNI(vmss *armcompute.VirtualMachineScaleSet, vmssNam
 			Name: to.Ptr(fmt.Sprintf("%s%d", vmssName, i)),
 			Properties: &armcompute.VirtualMachineScaleSetIPConfigurationProperties{
 				Subnet: &armcompute.APIEntityReference{
-					ID: to.Ptr(opts.subnetID),
+					ID: to.Ptr(opts.clusterConfig.subnetId),
 				},
 			},
 		}
@@ -150,7 +162,7 @@ func getVMPrivateIPAddress(ctx context.Context, cloud *azureClient, subscription
 		return "", err
 	}
 
-	privateIP, err := extractPrivateIP(instanceNICResult)
+	privateIP, err := getPrivateIP(instanceNICResult)
 	if err != nil {
 		return "", err
 	}
@@ -158,9 +170,48 @@ func getVMPrivateIPAddress(ctx context.Context, cloud *azureClient, subscription
 	return privateIP, nil
 }
 
-func getBaseVMSSModel(name, location, mcResourceGroupName, subnetID, sshPublicKey, customData, cseCmd string) armcompute.VirtualMachineScaleSet {
+// Returns a newly generated RSA public/private key pair with the private key in PEM format.
+func getNewRSAKeyPair(r *mrand.Rand) (privatePEMBytes []byte, publicKeyBytes []byte, e error) {
+	privateKey, err := rsa.GenerateKey(r, 4096)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create rsa private key: %w", err)
+	}
+
+	err = privateKey.Validate()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to validate rsa private key: %w", err)
+	}
+
+	publicRsaKey, err := ssh.NewPublicKey(&privateKey.PublicKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to convert private to public key: %w", err)
+	}
+
+	publicKeyBytes = ssh.MarshalAuthorizedKey(publicRsaKey)
+
+	// Get ASN.1 DER format
+	privDER := x509.MarshalPKCS1PrivateKey(privateKey)
+
+	// pem.Block
+	privBlock := pem.Block{
+		Type:    "RSA PRIVATE KEY",
+		Headers: nil,
+		Bytes:   privDER,
+	}
+
+	// Private key in PEM format
+	privatePEMBytes = pem.EncodeToMemory(&privBlock)
+
+	return
+}
+
+func getVmssName(r *mrand.Rand) string {
+	return fmt.Sprintf(vmssNameTemplate, randomLowercaseString(r, 4))
+}
+
+func getBaseVMSSModel(name, sshPublicKey, customData, cseCmd string, opts *scenarioRunOpts) armcompute.VirtualMachineScaleSet {
 	return armcompute.VirtualMachineScaleSet{
-		Location: to.Ptr(location),
+		Location: to.Ptr(opts.suiteConfig.Location),
 		SKU: &armcompute.SKU{
 			Name:     to.Ptr("Standard_DS2_v2"),
 			Capacity: to.Ptr[int64](1),
@@ -205,7 +256,7 @@ func getBaseVMSSModel(name, location, mcResourceGroupName, subnetID, sshPublicKe
 				},
 				StorageProfile: &armcompute.VirtualMachineScaleSetStorageProfile{
 					ImageReference: &armcompute.ImageReference{
-						ID: to.Ptr(scenario.DefaultImageVersionIDs["ubuntu1804"]),
+						ID: to.Ptr(string(scenario.BaseVHDCatalog.Ubuntu1804.Gen2Containerd.ResourceID)),
 					},
 					OSDisk: &armcompute.VirtualMachineScaleSetOSDisk{
 						CreateOption: to.Ptr(armcompute.DiskCreateOptionTypesFromImage),
@@ -229,14 +280,15 @@ func getBaseVMSSModel(name, location, mcResourceGroupName, subnetID, sshPublicKe
 												{
 													ID: to.Ptr(
 														fmt.Sprintf(
-															"/subscriptions/8ecadfc9-d1a3-4ea4-b844-0d9f87e4d7c8/resourceGroups/%s/providers/Microsoft.Network/loadBalancers/kubernetes/backendAddressPools/aksOutboundBackendPool",
-															mcResourceGroupName,
+															loadBalancerBackendAddressPoolIDTemplate,
+															opts.suiteConfig.Subscription,
+															*opts.clusterConfig.cluster.Properties.NodeResourceGroup,
 														),
 													),
 												},
 											},
 											Subnet: &armcompute.APIEntityReference{
-												ID: to.Ptr(subnetID),
+												ID: to.Ptr(opts.clusterConfig.subnetId),
 											},
 										},
 									},
@@ -250,6 +302,17 @@ func getBaseVMSSModel(name, location, mcResourceGroupName, subnetID, sshPublicKe
 	}
 }
 
+func getPrivateIP(res listVMSSVMNetworkInterfaceResult) (string, error) {
+	if len(res.Value) > 0 {
+		v := res.Value[0]
+		if len(v.Properties.IPConfigurations) > 0 {
+			ipconfig := v.Properties.IPConfigurations[0]
+			return ipconfig.Properties.PrivateIPAddress, nil
+		}
+	}
+	return "", fmt.Errorf("unable to extract private IP address from listVMSSNetworkInterfaceResult:\n%+v", res)
+}
+
 func getVMSSNICConfig(vmss *armcompute.VirtualMachineScaleSet) (*armcompute.VirtualMachineScaleSetNetworkConfiguration, error) {
 	if vmss != nil && vmss.Properties != nil &&
 		vmss.Properties.VirtualMachineProfile != nil && vmss.Properties.VirtualMachineProfile.NetworkProfile != nil {
@@ -259,4 +322,52 @@ func getVMSSNICConfig(vmss *armcompute.VirtualMachineScaleSet) (*armcompute.Virt
 		}
 	}
 	return nil, fmt.Errorf("unable to extract vmss nic info, vmss model or vmss model properties were nil/empty:\n%+v", vmss)
+}
+
+type listVMSSVMNetworkInterfaceResult struct {
+	Value []struct {
+		Name       string `json:"name,omitempty"`
+		ID         string `json:"id,omitempty"`
+		Properties struct {
+			ProvisioningState string `json:"provisioningState,omitempty"`
+			IPConfigurations  []struct {
+				Name       string `json:"name,omitempty"`
+				ID         string `json:"id,omitempty"`
+				Properties struct {
+					ProvisioningState         string `json:"provisioningState,omitempty"`
+					PrivateIPAddress          string `json:"privateIPAddress,omitempty"`
+					PrivateIPAllocationMethod string `json:"privateIPAllocationMethod,omitempty"`
+					PublicIPAddress           struct {
+						ID string `json:"id,omitempty"`
+					} `json:"publicIPAddress,omitempty"`
+					Subnet struct {
+						ID string `json:"id,omitempty"`
+					} `json:"subnet,omitempty"`
+					Primary                         bool   `json:"primary,omitempty"`
+					PrivateIPAddressVersion         string `json:"privateIPAddressVersion,omitempty"`
+					LoadBalancerBackendAddressPools []struct {
+						ID string `json:"id,omitempty"`
+					} `json:"loadBalancerBackendAddressPools,omitempty"`
+					LoadBalancerInboundNatRules []struct {
+						ID string `json:"id,omitempty"`
+					} `json:"loadBalancerInboundNatRules,omitempty"`
+				} `json:"properties,omitempty"`
+			} `json:"ipConfigurations,omitempty"`
+			DNSSettings struct {
+				DNSServers               []interface{} `json:"dnsServers,omitempty"`
+				AppliedDNSServers        []interface{} `json:"appliedDnsServers,omitempty"`
+				InternalDomainNameSuffix string        `json:"internalDomainNameSuffix,omitempty"`
+			} `json:"dnsSettings,omitempty"`
+			MacAddress                  string `json:"macAddress,omitempty"`
+			EnableAcceleratedNetworking bool   `json:"enableAcceleratedNetworking,omitempty"`
+			EnableIPForwarding          bool   `json:"enableIPForwarding,omitempty"`
+			NetworkSecurityGroup        struct {
+				ID string `json:"id,omitempty"`
+			} `json:"networkSecurityGroup,omitempty"`
+			Primary        bool `json:"primary,omitempty"`
+			VirtualMachine struct {
+				ID string `json:"id,omitempty"`
+			} `json:"virtualMachine,omitempty"`
+		} `json:"properties,omitempty"`
+	} `json:"value,omitempty"`
 }

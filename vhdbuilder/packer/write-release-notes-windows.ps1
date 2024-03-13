@@ -77,36 +77,88 @@ Log "`thttps://docs.microsoft.com/en-us/windows/deployment/update/waas-wu-settin
 $wuRegistryKeys = @(
     "HKLM:SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate",
     "HKLM:SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU",
-    "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State"
+    "HKLM:\SYSTEM\CurrentControlSet\Services\hns\State",
+    "HKLM:\SYSTEM\CurrentControlSet\Services\wcifs",
+    "HKLM:\SYSTEM\CurrentControlSet\Policies\Microsoft\FeatureManagement\Overrides",
+    "HKLM:\SYSTEM\CurrentControlSet\Services\VfpExt\Parameters",
+    "HKLM:\SYSTEM\CurrentControlSet\Control\Windows Containers"
+)
+
+$wuRegistryNames = @(
+    "NoAutoUpdate",
+    "EnableCompartmentNamespace",
+    "HNSControlFlag",
+    "HnsPolicyUpdateChange",
+    "HnsNatAllowRuleUpdateChange",
+    "HnsAclUpdateChange",
+    "HNSFixExtensionUponRehydration",
+    "HnsNpmRefresh",
+    "HnsNodeToClusterIpv6",
+    "HNSNpmIpsetLimitChange",
+    "HNSLbNatDupRuleChange",
+    "HNSUpdatePolicyForEndpointChange",
+    "WcifsSOPCountDisabled",
+    "3105872524",
+    "2629306509",
+    "3508525708",
+    "1995963020",
+    "189519500",
+    "VfpEvenPodDistributionIsEnabled",
+    "VfpIpv6DipsPrintingIsEnabled",
+    "3230913164",
+    "3398685324",
+    "87798413",
+    "4289201804",
+    "1355135117",
+    "RemoveSourcePortPreservationForRest",
+    "2214038156",
+    "VfpNotReuseTcpOneWayFlowIsEnabled",
+    "1673770637",
+    "FwPerfImprovementChange",
+    "CleanupReservedPorts",
+    "652313229",
+    "2059235981",
+    "3767762061",
+    "527922829",
+    "DeltaHivePolicy",
+    "2193453709",
+    "3331554445",
+    "1102009996",
+    "OverrideReceiveRoutingForLocalAddressesIpv4",
+    "OverrideReceiveRoutingForLocalAddressesIpv6",
+    "1327590028"
 )
 
 foreach ($key in $wuRegistryKeys) {
+    # Windows 2019 does not have the Windows Containers key
+    if ($($systemInfo.CurrentBuildNumber) -eq 17763 -and $key -eq "HKLM:\SYSTEM\CurrentControlSet\Control\Windows Containers") {
+        continue
+    }
     Log ("`t{0}" -f $key)
-    Get-Item -Path $key |
-    Select-Object -ExpandProperty property |
-    ForEach-Object {
-        Log ("`t`t{0} : {1}" -f $_, (Get-ItemProperty -Path $key -Name $_).$_)
+    $regPath=(Get-Item -Path $key -ErrorAction Ignore)
+    if ($regPath) {
+        Get-Item -Path $key |
+        Select-Object -ExpandProperty property |
+        ForEach-Object {
+            if ($wuRegistryNames -contains $_) {
+                Log ("`t`t{0} : {1}" -f $_, (Get-ItemProperty -Path $key -Name $_).$_)
+            }
+        }
+    } else {
+        Log "$key doesn't exist in current OS."
     }
 }
 Log ""
 
-if ($env:containerRuntime -eq 'docker') {
-    Log "Docker Info"
-    $dockerVersion = (docker --version) | Out-String
-    Log ("Version: {0}" -f $dockerVersion)
-    Log "Images:"
-    Log (docker images --format='{{json .}}' | ConvertFrom-Json | Format-Table Repository, Tag, ID)
-} else {
-    Log "ContainerD Info"
-    # starting containerd for printing containerD info, the same way as we pre-pull containerD images in configure-windows-vhd.ps1
-    Start-Job -Name containerd -ScriptBlock { containerd.exe }
-    $containerDVersion = (ctr.exe --version) | Out-String
-    Log ("Version: {0}" -f $containerDVersion)
-    Log "Images:"
-    Log (ctr.exe -n k8s.io image ls)
-    Stop-Job  -Name containerd
-    Remove-Job -Name containerd
-}
+Log "ContainerD Info"
+# starting containerd for printing containerD info, the same way as we pre-pull containerD images in configure-windows-vhd.ps1
+Start-Job -Name containerd -ScriptBlock { containerd.exe }
+$containerDVersion = (ctr.exe --version) | Out-String
+Log ("Version: {0}" -f $containerDVersion)
+Log "Images:"
+Log (ctr.exe -n k8s.io image ls)
+Stop-Job  -Name containerd
+Remove-Job -Name containerd
 Log ""
 
 Log "Cached Files:"

@@ -69,8 +69,8 @@ const (
 	DefaultEnableCSIProxyWindows = false
 	// DefaultWindowsSSHEnabled is the default windowsProfile.sshEnabled value.
 	DefaultWindowsSSHEnabled = true
-	// DefaultWindowsSecureTlsEnabled is the default windowsProfile.WindowsSecureTlsEnabled value.
-	DefaultWindowsSecureTlsEnabled = false
+	// DefaultWindowsSecureTLSEnabled is the default windowsProfile.WindowsSecureTlsEnabled value.
+	DefaultWindowsSecureTLSEnabled = false
 )
 
 const (
@@ -119,17 +119,25 @@ const (
 
 const (
 	Nvidia470CudaDriverVersion = "cuda-470.82.01"
-	Nvidia510CudaDriverVersion = "cuda-510.47.03"
-	Nvidia525CudaDriverVersion = "cuda-525.85.12"
-	Nvidia510GridDriverVersion = "grid-510.73.08"
+	Nvidia535CudaDriverVersion = "cuda-535.54.03"
+	Nvidia535GridDriverVersion = "grid-535.54.03"
 )
 
-// these sizes use a "converged" driver to support both cuda/grid workloads.
-// how do you figure this out? ask HPC or find out by trial and error.
-// installing vanilla cuda drivers will fail to install with opaque errors.
-// nvidia-bug-report.sh will is helpful, but usually it tells you the pci card id is incompatible.
-// That sends me to HPC folks.
-// see https://github.com/Azure/azhpc-extensions/blob/daaefd78df6f27012caf30f3b54c3bd6dc437652/NvidiaGPU/resources.json
+// These SHAs will change once we update aks-gpu images in aks-gpu repository. We do that fairly rarely at this time
+// So for now these will be kept here like this.
+const (
+	AKSGPUGridSHA = "sha-20ffa2"
+	AKSGPUCudaSHA = "sha-ff213d"
+)
+
+/* ConvergedGPUDriverSizes : these sizes use a "converged" driver to support both cuda/grid workloads.
+how do you figure this out? ask HPC or find out by trial and error.
+installing vanilla cuda drivers will fail to install with opaque errors.
+nvidia-bug-report.sh may be helpful, but usually it tells you the pci card id is incompatible.
+That sends me to HPC folks.
+see https://github.com/Azure/azhpc-extensions/blob/daaefd78df6f27012caf30f3b54c3bd6dc437652/NvidiaGPU/resources.json
+*/
+//nolint:gochecknoglobals
 var ConvergedGPUDriverSizes = map[string]bool{
 	"standard_nv6ads_a10_v5":   true,
 	"standard_nv12ads_a10_v5":  true,
@@ -148,6 +156,7 @@ new MIG-capable skus which require fabricmanager for nvlink training.
 Specifically, the 8-board VM sizes (ND96 and larger).
 Check with HPC or SKU API folks if we can improve this...
 */
+//nolint:gochecknoglobals
 var FabricManagerGPUSizes = map[string]bool{
 	// A100
 	"standard_nd96asr_v4":        true,
@@ -179,6 +188,7 @@ var FabricManagerGPUSizes = map[string]bool{
 const (
 	OSSKUCBLMariner = "CBLMariner"
 	OSSKUMariner    = "Mariner"
+	OSSKUAzureLinux = "AzureLinux"
 )
 
 // Feature Flags.

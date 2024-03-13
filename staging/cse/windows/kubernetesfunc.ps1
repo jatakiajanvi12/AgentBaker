@@ -3,7 +3,7 @@ function Get-ProvisioningScripts {
         Set-ExitCode -ExitCode $global:WINDOWS_CSE_ERROR_NOT_FOUND_PROVISIONING_SCRIPTS -ErrorMessage "Failed to found provisioning scripts"
     }
     Write-Log "Copying provisioning scripts"
-    Move-Item 'c:\AzureData\windows\provisioningscripts\*' 'c:\k'
+    Move-Item 'c:\AzureData\windows\provisioningscripts\*' 'c:\k' -Force
     Remove-Item -Path 'c:\AzureData\windows\provisioningscripts' -Force
 }
 
@@ -29,6 +29,8 @@ function Initialize-DataDirectories {
     # Some of the Kubernetes tests that were designed for Linux try to mount /tmp into a pod
     # On Windows, Go translates to c:\tmp. If that path doesn't exist, then some node tests fail
 
+    Logs-To-Event -TaskName "AKS.WindowsCSE.InitializeDataDirectories" -TaskMessage "Start to create required data directories as needed"
+   
     $requiredPaths = 'c:\tmp'
 
     $requiredPaths | ForEach-Object {
@@ -46,6 +48,7 @@ function Get-LogCollectionScripts {
 }
 
 function Register-LogsCleanupScriptTask {
+    Logs-To-Event -TaskName "AKS.WindowsCSE.RegisterLogsCleanupScriptTask" -TaskMessage "Start to register logs cleanup script task"
     Write-Log "Creating a scheduled task to run windowslogscleanup.ps1"
 
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"c:\k\windowslogscleanup.ps1`""
@@ -56,6 +59,7 @@ function Register-LogsCleanupScriptTask {
 }
 
 function Register-NodeResetScriptTask {
+    Logs-To-Event -TaskName "AKS.WindowsCSE.RegisterNodeResetScriptTask" -TaskMessage "Start to register node reset script task. HNSRemediatorIntervalInMinutes: $global:HNSRemediatorIntervalInMinutes"
     Write-Log "Creating a startup task to run windowsnodereset.ps1"
 
     $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-File `"c:\k\windowsnodereset.ps1`""
@@ -74,10 +78,12 @@ function Write-KubeClusterConfig {
         $KubeDnsServiceIp
     )
 
+    Logs-To-Event -TaskName "AKS.WindowsCSE.WriteKubeClusterConfig" -TaskMessage "Start to write KubeCluster Config. WindowsPauseImageURL: $global:WindowsPauseImageURL"
+
     $Global:ClusterConfiguration = [PSCustomObject]@{ }
 
     $Global:ClusterConfiguration | Add-Member -MemberType NoteProperty -Name Cri -Value @{
-        Name   = $global:ContainerRuntime;
+        Name   = "containerd";
         Images = @{
             # e.g. "mcr.microsoft.com/oss/kubernetes/pause:1.4.1"
             "Pause" = $global:WindowsPauseImageURL
@@ -133,6 +139,8 @@ function Write-KubeClusterConfig {
 }
 
 function Update-DefenderPreferences {
+    Logs-To-Event -TaskName "AKS.WindowsCSE.UpdateDefenderPreferences" -TaskMessage "Start to update defender preferences"
+
     Add-MpPreference -ExclusionProcess "c:\k\kubelet.exe"
     Add-MpPreference -ExclusionProcess "c:\k\kube-proxy.exe"
 
@@ -144,16 +152,14 @@ function Update-DefenderPreferences {
     Add-MpPreference -ExclusionProcess "C:\k\azurecni\bin\azure-vnet.exe"
     Add-MpPreference -ExclusionProcess "C:\k\azurecni\bin\AzureNetworkContainer.exe"
     Add-MpPreference -ExclusionProcess "C:\k\azurecni\bin\CnsWrapperService.exe"
+    Add-MpPreference -ExclusionPath "C:\k\azurecns\azure-endpoints.json"
+    Add-MpPreference -ExclusionPath "C:\k\azure-vnet.log"
 
     if ($global:EnableCsiProxy) {
         Add-MpPreference -ExclusionProcess "c:\k\csi-proxy.exe"
     }
 
-    if ($global:ContainerRuntime -eq 'containerd') {
-        Add-MpPreference -ExclusionProcess "c:\program files\containerd\containerd.exe"
-    } else {
-        Add-MpPreference -ExclusionProcess "C:\Program Files\Docker\dockerd.exe"
-    }
+    Add-MpPreference -ExclusionProcess "c:\program files\containerd\containerd.exe"
 }
 
 function Check-APIServerConnectivity {
@@ -165,7 +171,7 @@ function Check-APIServerConnectivity {
         [Parameter(Mandatory = $false)][int]
         $ConnectTimeout = 10,  #seconds
         [Parameter(Mandatory = $false)][int]
-        $MaxRetryCount = 100
+        $MaxRetryCount = 60
     )
     $retryCount=0
 

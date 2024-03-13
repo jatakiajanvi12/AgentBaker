@@ -29,11 +29,9 @@ configureTransparentHugePage() {
 }
 
 configureSwapFile() {
-    # https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/troubleshoot-device-names-problems#identify-disk-luns
     swap_size_kb=$(expr ${SWAP_FILE_SIZE_MB} \* 1000)
     swap_location=""
     
-    # Attempt to use the resource disk
     if [[ -L /dev/disk/azure/resource-part1 ]]; then
         resource_disk_path=$(findmnt -nr -o target -S $(readlink -f /dev/disk/azure/resource-part1))
         disk_free_kb=$(df ${resource_disk_path} | sed 1d | awk '{print $4}')
@@ -45,9 +43,7 @@ configureSwapFile() {
         fi
     fi
 
-    # If we couldn't use the resource disk, attempt to use the OS disk
     if [[ -z "${swap_location}" ]]; then
-        # Directly check size on the root directory since we can't rely on 'root-part1' always being the correct label
         os_device=$(readlink -f /dev/disk/azure/root)
         disk_free_kb=$(df -P / | sed 1d | awk '{print $4}')
         if [[ ${disk_free_kb} -gt ${swap_size_kb} ]]; then
@@ -74,10 +70,9 @@ configureEtcEnvironment() {
     chmod 0644 /etc/systemd/system.conf.d/proxy.conf
 
     mkdir -p  /etc/apt/apt.conf.d
-    chmod 0644 /etc/apt/apt.conf.d/95proxy
     touch /etc/apt/apt.conf.d/95proxy
+    chmod 0644 /etc/apt/apt.conf.d/95proxy
 
-    # TODO(ace): this pains me but quick and dirty refactor
     echo "[Manager]" >> /etc/systemd/system.conf.d/proxy.conf
     if [ "${HTTP_PROXY_URLS}" != "" ]; then
         echo "HTTP_PROXY=${HTTP_PROXY_URLS}" >> /etc/environment
@@ -100,7 +95,6 @@ configureEtcEnvironment() {
         echo "DefaultEnvironment=\"no_proxy=${NO_PROXY_URLS}\"" >> /etc/systemd/system.conf.d/proxy.conf
     fi
 
-    # for kubelet to pick up the proxy
     mkdir -p "/etc/systemd/system/kubelet.service.d"
     tee "/etc/systemd/system/kubelet.service.d/10-httpproxy.conf" > /dev/null <<'EOF'
 [Service]
@@ -123,25 +117,24 @@ configureHTTPProxyCA() {
 configureCustomCaCertificate() {
     mkdir -p /opt/certs
     for i in $(seq 0 $((${CUSTOM_CA_TRUST_COUNT} - 1))); do
-        # directly referring to the variable as "${CUSTOM_CA_CERT_${i}}"
-        # causes bad substitution errors in bash
-        # dynamically declare and use `!` to add a layer of indirection
         declare varname=CUSTOM_CA_CERT_${i} 
         echo "${!varname}" | base64 -d > /opt/certs/00000000000000cert${i}.crt
     done
-    # This will block until the service is considered active.
-    # Update_certs.service is a oneshot type of unit that
-    # is considered active when the ExecStart= command terminates with a zero status code.
     systemctl restart update_certs.service || exit $ERR_UPDATE_CA_CERTS
-    # after new certs are added to trust store, containerd will not pick them up properly before restart.
-    # aim here is to have this working straight away for a freshly provisioned node
-    # so we force a restart after the certs are updated
-    # custom CA daemonset copies certs passed by the user to the node, what then triggers update_certs.path unit
-    # path unit then triggers the script that copies over cert files to correct location on the node and updates the trust store
-    # as a part of this flow we could restart containerd everytime a new cert is added to the trust store using custom CA
     systemctl restart containerd
 }
 
+configureContainerdUlimits() {
+  CONTAINERD_ULIMIT_DROP_IN_FILE_PATH="/etc/systemd/system/containerd.service.d/set_ulimits.conf"
+  touch "${CONTAINERD_ULIMIT_DROP_IN_FILE_PATH}"
+  chmod 0600 "${CONTAINERD_ULIMIT_DROP_IN_FILE_PATH}"
+  tee "${CONTAINERD_ULIMIT_DROP_IN_FILE_PATH}" > /dev/null <<EOF
+$(echo "$CONTAINERD_ULIMITS" | tr ' ' '\n')
+EOF
+
+  systemctl daemon-reload
+  systemctl restart containerd
+}
 
 configureKubeletServerCert() {
     KUBELET_SERVER_PRIVATE_KEY_PATH="/etc/kubernetes/certs/kubeletserver.key"
@@ -175,12 +168,11 @@ configureK8s() {
 
     set +x
     echo "${APISERVER_PUBLIC_KEY}" | base64 --decode > "${APISERVER_PUBLIC_KEY_PATH}"
-    # Perform the required JSON escaping
     SP_FILE="/etc/kubernetes/sp.txt"
     SERVICE_PRINCIPAL_CLIENT_SECRET="$(cat "$SP_FILE")"
     SERVICE_PRINCIPAL_CLIENT_SECRET=${SERVICE_PRINCIPAL_CLIENT_SECRET//\\/\\\\}
     SERVICE_PRINCIPAL_CLIENT_SECRET=${SERVICE_PRINCIPAL_CLIENT_SECRET//\"/\\\"}
-    rm "$SP_FILE" # unneeded after reading from disk.
+    rm "$SP_FILE"
     cat << EOF > "${AZURE_JSON_PATH}"
 {
     "cloud": "${TARGET_CLOUD}",
@@ -258,7 +250,6 @@ EOF
 }
 
 configureCNI() {
-    # needed for the iptables rules to work on bridges
     retrycmd_if_failure 120 5 25 modprobe br_netfilter || exit $ERR_MODPROBE_FAIL
     echo -n "br_netfilter" > /etc/modules-load.d/br_netfilter.conf
     configureCNIIPTables
@@ -300,8 +291,19 @@ ensureContainerd() {
 ExecStartPost=/sbin/iptables -P FORWARD ACCEPT
 EOF
 
+  if [ "${ARTIFACT_STREAMING_ENABLED}" == "true" ]; then
+    logs_to_events "AKS.CSE.ensureContainerd.ensureArtifactStreaming" ensureArtifactStreaming || exit $ERR_ARTIFACT_STREAMING_INSTALL
+  fi
+
   mkdir -p /etc/containerd
-  echo "${CONTAINERD_CONFIG_CONTENT}" | base64 -d > /etc/containerd/config.toml || exit $ERR_FILE_WATCH_TIMEOUT
+  if [[ "${GPU_NODE}" = true ]] && [[ "${skip_nvidia_driver_install}" == "true" ]]; then
+    echo "Generating non-GPU containerd config for GPU node due to VM tags"
+    echo "${CONTAINERD_CONFIG_NO_GPU_CONTENT}" | base64 -d > /etc/containerd/config.toml || exit $ERR_FILE_WATCH_TIMEOUT
+  else
+    echo "Generating containerd config..."
+    echo "${CONTAINERD_CONFIG_CONTENT}" | base64 -d > /etc/containerd/config.toml || exit $ERR_FILE_WATCH_TIMEOUT
+  fi
+
   tee "/etc/sysctl.d/99-force-bridge-forward.conf" > /dev/null <<EOF 
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.forwarding = 1
@@ -314,22 +316,35 @@ EOF
 }
 
 ensureNoDupOnPromiscuBridge() {
-    wait_for_file 1200 1 /opt/azure/containers/ensure-no-dup.sh || exit $ERR_FILE_WATCH_TIMEOUT
-    wait_for_file 1200 1 /etc/systemd/system/ensure-no-dup.service || exit $ERR_FILE_WATCH_TIMEOUT
     systemctlEnableAndStart ensure-no-dup || exit $ERR_SYSTEMCTL_START_FAIL
 }
 
 ensureTeleportd() {
-    wait_for_file 1200 1 /etc/systemd/system/teleportd.service || exit $ERR_FILE_WATCH_TIMEOUT
     systemctlEnableAndStart teleportd || exit $ERR_SYSTEMCTL_START_FAIL
+}
+
+ensureArtifactStreaming() {
+  systemctl enable acr-mirror.service
+  systemctl start acr-mirror.service
+  sudo /opt/acr/tools/overlaybd/install.sh
+  sudo /opt/acr/tools/overlaybd/enable-http-auth.sh
+  sudo /opt/acr/tools/overlaybd/config.sh download.enable false
+  sudo /opt/acr/tools/overlaybd/config.sh cacheConfig.cacheSizeGB 32
+  sudo /opt/acr/tools/overlaybd/config.sh exporterConfig.enable true
+  sudo /opt/acr/tools/overlaybd/config.sh exporterConfig.port 9863
+  modprobe target_core_user
+  curl -X PUT 'localhost:8578/config?ns=_default&enable_suffix=azurecr.io&stream_format=overlaybd' -O
+  systemctl enable /opt/overlaybd/overlaybd-tcmu.service
+  systemctl enable /opt/overlaybd/snapshotter/overlaybd-snapshotter.service
+  systemctl start overlaybd-tcmu
+  systemctl start overlaybd-snapshotter
+  systemctl start acr-nodemon
 }
 
 ensureDocker() {
     DOCKER_SERVICE_EXEC_START_FILE=/etc/systemd/system/docker.service.d/exec_start.conf
-    wait_for_file 1200 1 $DOCKER_SERVICE_EXEC_START_FILE || exit $ERR_FILE_WATCH_TIMEOUT
     usermod -aG docker ${ADMINUSER}
     DOCKER_MOUNT_FLAGS_SYSTEMD_FILE=/etc/systemd/system/docker.service.d/clear_mount_propagation_flags.conf
-    wait_for_file 1200 1 $DOCKER_MOUNT_FLAGS_SYSTEMD_FILE || exit $ERR_FILE_WATCH_TIMEOUT
     DOCKER_JSON_FILE=/etc/docker/daemon.json
     for i in $(seq 1 1200); do
         if [ -s $DOCKER_JSON_FILE ]; then
@@ -347,23 +362,28 @@ ensureDocker() {
 }
 
 ensureDHCPv6() {
-    wait_for_file 3600 1 "${DHCPV6_SERVICE_FILEPATH}" || exit $ERR_FILE_WATCH_TIMEOUT
-    wait_for_file 3600 1 "${DHCPV6_CONFIG_FILEPATH}" || exit $ERR_FILE_WATCH_TIMEOUT
     systemctlEnableAndStart dhcpv6 || exit $ERR_SYSTEMCTL_START_FAIL
     retrycmd_if_failure 120 5 25 modprobe ip6_tables || exit $ERR_MODPROBE_FAIL
 }
 
 ensureKubelet() {
-    # ensure cloud init completes
-    # avoids potential corruption of files written by cloud init and CSE concurrently.
-    # removes need for wait_for_file and EOF markers
-    cloud-init status --wait
+    KUBELET_DEFAULT_FILE=/etc/default/kubelet
+    mkdir -p /etc/default
+    echo "KUBELET_FLAGS=${KUBELET_FLAGS}" > "${KUBELET_DEFAULT_FILE}"
+    echo "KUBELET_REGISTER_SCHEDULABLE=true" >> "${KUBELET_DEFAULT_FILE}"
+    echo "NETWORK_POLICY=${NETWORK_POLICY}" >> "${KUBELET_DEFAULT_FILE}"
+    echo "KUBELET_IMAGE=${KUBELET_IMAGE}" >> "${KUBELET_DEFAULT_FILE}"
+    echo "KUBELET_NODE_LABELS=${KUBELET_NODE_LABELS}" >> "${KUBELET_DEFAULT_FILE}"
+    if [ -n "${AZURE_ENVIRONMENT_FILEPATH}" ]; then
+        echo "AZURE_ENVIRONMENT_FILEPATH=${AZURE_ENVIRONMENT_FILEPATH}" >> "${KUBELET_DEFAULT_FILE}"
+    fi
+    
     KUBE_CA_FILE="/etc/kubernetes/certs/ca.crt"
     mkdir -p "$(dirname "${KUBE_CA_FILE}")"
     echo "${KUBE_CA_CRT}" | base64 -d > "${KUBE_CA_FILE}"
     chmod 0600 "${KUBE_CA_FILE}"
-    
-    if [ "${CLIENT_TLS_BOOTSTRAPPING_ENABLED}" == "true" ]; then
+
+    if [ "${ENABLE_SECURE_TLS_BOOTSTRAPPING}" == "true" ] || [ "${ENABLE_TLS_BOOTSTRAPPING}" == "true" ]; then
         KUBELET_TLS_DROP_IN="/etc/systemd/system/kubelet.service.d/10-tlsbootstrap.conf"
         mkdir -p "$(dirname "${KUBELET_TLS_DROP_IN}")"
         touch "${KUBELET_TLS_DROP_IN}"
@@ -372,6 +392,45 @@ ensureKubelet() {
 [Service]
 Environment="KUBELET_TLS_BOOTSTRAP_FLAGS=--kubeconfig /var/lib/kubelet/kubeconfig --bootstrap-kubeconfig /var/lib/kubelet/bootstrap-kubeconfig"
 EOF
+    fi
+
+    if [ "${ENABLE_SECURE_TLS_BOOTSTRAPPING}" == "true" ]; then
+        AAD_RESOURCE="6dae42f8-4368-4678-94ff-3960e28e3630"
+        if [ -n "$CUSTOM_SECURE_TLS_BOOTSTRAP_AAD_SERVER_APP_ID" ]; then
+            AAD_RESOURCE=$CUSTOM_SECURE_TLS_BOOTSTRAP_AAD_SERVER_APP_ID
+        fi
+        SECURE_BOOTSTRAP_KUBECONFIG_FILE=/var/lib/kubelet/bootstrap-kubeconfig
+        mkdir -p "$(dirname "${SECURE_BOOTSTRAP_KUBECONFIG_FILE}")"
+        touch "${SECURE_BOOTSTRAP_KUBECONFIG_FILE}"
+        chmod 0644 "${SECURE_BOOTSTRAP_KUBECONFIG_FILE}"
+        tee "${SECURE_BOOTSTRAP_KUBECONFIG_FILE}" > /dev/null <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: localcluster
+  cluster:
+    certificate-authority: /etc/kubernetes/certs/ca.crt
+    server: https://${API_SERVER_NAME}:443
+users:
+- name: kubelet-bootstrap
+  user:
+    exec:
+        apiVersion: client.authentication.k8s.io/v1
+        command: /opt/azure/tlsbootstrap/tls-bootstrap-client
+        args:
+        - bootstrap
+        - --next-proto=aks-tls-bootstrap
+        - --aad-resource=${AAD_RESOURCE}
+        interactiveMode: Never
+        provideClusterInfo: true
+contexts:
+- context:
+    cluster: localcluster
+    user: kubelet-bootstrap
+  name: bootstrap-context
+current-context: bootstrap-context
+EOF
+    elif [ "${ENABLE_TLS_BOOTSTRAPPING}" == "true" ]; then
         BOOTSTRAP_KUBECONFIG_FILE=/var/lib/kubelet/bootstrap-kubeconfig
         mkdir -p "$(dirname "${BOOTSTRAP_KUBECONFIG_FILE}")"
         touch "${BOOTSTRAP_KUBECONFIG_FILE}"
@@ -421,21 +480,20 @@ contexts:
 current-context: localclustercontext
 EOF
     fi
+    
     KUBELET_RUNTIME_CONFIG_SCRIPT_FILE=/opt/azure/containers/kubelet.sh
     tee "${KUBELET_RUNTIME_CONFIG_SCRIPT_FILE}" > /dev/null <<EOF
 #!/bin/bash
-# Disallow container from reaching out to the special IP address 168.63.129.16
-# for TCP protocol (which http uses)
 #
-# 168.63.129.16 contains protected settings that have priviledged info.
 #
-# The host can still reach 168.63.129.16 because it goes through the OUTPUT chain, not FORWARD.
 #
-# Note: we should not block all traffic to 168.63.129.16. For example UDP traffic is still needed
-# for DNS.
 iptables -I FORWARD -d 168.63.129.16 -p tcp --dport 80 -j DROP
 EOF
     systemctlEnableAndStart kubelet || exit $ERR_KUBELET_START_FAIL
+}
+
+ensureSnapshotUpdate() {
+    systemctlEnableAndStart snapshot-update.timer || exit $ERR_SNAPSHOT_UPDATE_START_FAIL
 }
 
 ensureMigPartition(){
@@ -445,12 +503,15 @@ ensureMigPartition(){
 [Service]
 Environment="GPU_INSTANCE_PROFILE=${GPU_INSTANCE_PROFILE}"
 EOF
-    systemctlEnableAndStart mig-partition || exit $ERR_SYSTEMCTL_START_FAIL
+    systemctlEnableAndStart mig-partition
 }
 
 ensureSysctl() {
     SYSCTL_CONFIG_FILE=/etc/sysctl.d/999-sysctl-aks.conf
-    wait_for_file 1200 1 $SYSCTL_CONFIG_FILE || exit $ERR_FILE_WATCH_TIMEOUT
+    mkdir -p "$(dirname "${SYSCTL_CONFIG_FILE}")"
+    touch "${SYSCTL_CONFIG_FILE}"
+    chmod 0644 "${SYSCTL_CONFIG_FILE}"
+    echo "${SYSCTL_CONTENT}" | base64 -d > "${SYSCTL_CONFIG_FILE}"
     retrycmd_if_failure 24 5 25 sysctl --system
 }
 
@@ -502,7 +563,6 @@ users:
 
 configClusterAutoscalerAddon() {
     CLUSTER_AUTOSCALER_ADDON_FILE=/etc/kubernetes/addons/cluster-autoscaler-deployment.yaml
-    wait_for_file 1200 1 $CLUSTER_AUTOSCALER_ADDON_FILE || exit $ERR_FILE_WATCH_TIMEOUT
     sed -i "s|<clientID>|$(echo $SERVICE_PRINCIPAL_CLIENT_ID | base64)|g" $CLUSTER_AUTOSCALER_ADDON_FILE
     sed -i "s|<clientSec>|$(echo $SERVICE_PRINCIPAL_CLIENT_SECRET | base64)|g" $CLUSTER_AUTOSCALER_ADDON_FILE
     sed -i "s|<subID>|$(echo $SUBSCRIPTION_ID | base64)|g" $CLUSTER_AUTOSCALER_ADDON_FILE
@@ -518,7 +578,6 @@ configACIConnectorAddon() {
     ACI_CONNECTOR_CERT=$(base64 /etc/kubernetes/certs/aci-connector-cert.pem -w0)
 
     ACI_CONNECTOR_ADDON_FILE=/etc/kubernetes/addons/aci-connector-deployment.yaml
-    wait_for_file 1200 1 $ACI_CONNECTOR_ADDON_FILE || exit $ERR_FILE_WATCH_TIMEOUT
     sed -i "s|<creds>|$ACI_CONNECTOR_CREDENTIALS|g" $ACI_CONNECTOR_ADDON_FILE
     sed -i "s|<rgName>|$RESOURCE_GROUP|g" $ACI_CONNECTOR_ADDON_FILE
     sed -i "s|<cert>|$ACI_CONNECTOR_CERT|g" $ACI_CONNECTOR_ADDON_FILE
@@ -531,7 +590,6 @@ configAzurePolicyAddon() {
 }
 
 configGPUDrivers() {
-    # install gpu driver
     if [[ $OS == $UBUNTU_OS_NAME ]]; then
         mkdir -p /opt/{actions,gpu}
         if [[ "${CONTAINER_RUNTIME}" == "containerd" ]]; then
@@ -555,19 +613,20 @@ configGPUDrivers() {
     elif [[ $OS == $MARINER_OS_NAME ]]; then
         downloadGPUDrivers
         installNvidiaContainerRuntime
+        enableNvidiaPersistenceMode
     else 
         echo "os $OS not supported at this time. skipping configGPUDrivers"
         exit 1
     fi
 
-    # validate on host, already done inside container.
-    if [[ $OS == $UBUNTU_OS_NAME ]]; then
-        retrycmd_if_failure 120 5 25 nvidia-modprobe -u -c0 || exit $ERR_GPU_DRIVERS_START_FAIL
-    fi
+    retrycmd_if_failure 120 5 25 nvidia-modprobe -u -c0 || exit $ERR_GPU_DRIVERS_START_FAIL
     retrycmd_if_failure 120 5 300 nvidia-smi || exit $ERR_GPU_DRIVERS_START_FAIL
     retrycmd_if_failure 120 5 25 ldconfig || exit $ERR_GPU_DRIVERS_START_FAIL
+
+    if [[ $OS == $MARINER_OS_NAME ]]; then
+        createNvidiaSymlinkToAllDeviceNodes
+    fi
     
-    # reload containerd/dockerd
     if [[ "${CONTAINER_RUNTIME}" == "containerd" ]]; then
         retrycmd_if_failure 120 5 25 pkill -SIGHUP containerd || exit $ERR_GPU_DRIVERS_INSTALL_TIMEOUT
     else
@@ -577,7 +636,6 @@ configGPUDrivers() {
 
 validateGPUDrivers() {
     if [[ $(isARM64) == 1 ]]; then
-        # no GPU on ARM64
         return
     fi
 
@@ -602,7 +660,6 @@ validateGPUDrivers() {
 
 ensureGPUDrivers() {
     if [[ $(isARM64) == 1 ]]; then
-        # no GPU on ARM64
         return
     fi
 

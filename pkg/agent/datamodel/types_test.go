@@ -4,6 +4,7 @@
 package datamodel
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -946,6 +947,110 @@ func TestAgentPoolProfileIs2204VHDDistro(t *testing.T) {
 	}
 }
 
+func TestAgentPoolProfileIsAzureLinuxCgroupV2VHDDistro(t *testing.T) {
+	cases := []struct {
+		name     string
+		ap       AgentPoolProfile
+		expected bool
+	}{
+		{
+			name: "Azure Linux V2 Gen1 VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSAzureLinuxV2,
+			},
+			expected: true,
+		},
+		{
+			name: "Azure Linux V2 Gen2 VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSAzureLinuxV2Gen2,
+			},
+			expected: true,
+		},
+		{
+			name: "Azure Linux V2 Gen2 ARM64 VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSAzureLinuxV2Arm64Gen2,
+			},
+			expected: true,
+		},
+		{
+			name: "Azure Linux V2 Gen1 FIPS VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSAzureLinuxV2FIPS,
+			},
+			expected: true,
+		},
+		{
+			name: "Azure Linux V2 Gen2 FIPS VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSAzureLinuxV2Gen2FIPS,
+			},
+			expected: true,
+		},
+		{
+			name: "Azure Linux V2 Gen2 TrustedLaunch VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSAzureLinuxV2Gen2TL,
+			},
+			expected: true,
+		},
+		{
+			name: "Azure Linux V2 Gen2 Kata VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSAzureLinuxV2Gen2Kata,
+			},
+			expected: true,
+		},
+		{
+			name: "CBLMariner V2 Gen2 VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSCBLMarinerV2Gen2,
+			},
+			expected: false,
+		},
+		{
+			name: "CBLMariner V2 Gen1 FIPS VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSCBLMarinerV2FIPS,
+			},
+			expected: false,
+		},
+		{
+			name: "CBLMariner V2 Gen2 ARM64 VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSCBLMarinerV2Arm64Gen2,
+			},
+			expected: false,
+		},
+		{
+			name: "CBLMariner V2 Gen2 TrustedLaunch VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSCBLMarinerV2Gen2TL,
+			},
+			expected: false,
+		},
+		{
+			name: "18.04 Ubuntu VHD distro",
+			ap: AgentPoolProfile{
+				Distro: AKSUbuntuContainerd1804,
+			},
+			expected: false,
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			if c.expected != c.ap.IsAzureLinuxCgroupV2VHDDistro() {
+				t.Fatalf("Got unexpected AgentPoolProfile.IsAzureLinuxCgroupV2VHDDistro() result. Expected: %t. Got: %t.",
+					c.expected, c.ap.IsAzureLinuxCgroupV2VHDDistro())
+			}
+		})
+	}
+}
+
 func TestIsCustomVNET(t *testing.T) {
 	cases := []struct {
 		p             Properties
@@ -1010,9 +1115,9 @@ func TestAgentPoolProfileGetKubernetesLabels(t *testing.T) {
 		c := c
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
-			if c.expected != c.ap.GetKubernetesLabels(c.rg, c.deprecated, c.nvidiaEnabled, c.fipsEnabled, c.osSku) {
+			if c.expected != c.ap.GetKubernetesLabels() {
 				t.Fatalf("Got unexpected AgentPoolProfile.GetKubernetesLabels(%s, %t) result. Expected: %s. Got: %s.",
-					c.rg, c.deprecated, c.expected, c.ap.GetKubernetesLabels(c.rg, c.deprecated, c.nvidiaEnabled, c.fipsEnabled, c.osSku))
+					c.rg, c.deprecated, c.expected, c.ap.GetKubernetesLabels())
 			}
 		})
 	}
@@ -1273,6 +1378,7 @@ func TestLinuxProfile(t *testing.T) {
 	}
 }
 
+//nolint:gocognit
 func TestWindowsProfile(t *testing.T) {
 	trueVar := true
 	w := WindowsProfile{}
@@ -1356,6 +1462,8 @@ func TestWindowsProfile(t *testing.T) {
 				{BuildNumber: "18362"},
 			},
 		},
+		WindowsGmsaPackageUrl:   "windows-gmsa-package-url",
+		WindowsSecureTlsEnabled: to.BoolPtr(false),
 	}
 
 	dv = w.GetWindowsDockerVersion()
@@ -1381,6 +1489,53 @@ func TestWindowsProfile(t *testing.T) {
 	se := w.GetSSHEnabled()
 	if !se {
 		t.Fatalf("Expected SSHEnabled to return true, got %v", se)
+	}
+
+	jsonBytes, err := json.Marshal(w)
+	if err != nil {
+		t.Fatalf("Expected JSON marshal to not return an error, but returned: %s", err)
+	}
+
+	unmarshalled := WindowsProfile{}
+	if err = json.Unmarshal(jsonBytes, &unmarshalled); err != nil {
+		t.Fatalf("Expected JSON unmarshal to not return an error, but returned: %s", err)
+	}
+
+	dv = unmarshalled.GetWindowsDockerVersion()
+	if dv != "18.03.1-ee-3" {
+		t.Fatalf("Expected unmarshalled GetWindowsDockerVersion() to equal 18.03.1-ee-3, got %s", dv)
+	}
+
+	windowsSku = unmarshalled.GetWindowsSku()
+	if windowsSku != "Datacenter-Core-1809-with-Containers-smalldisk" {
+		t.Fatalf("Expected unmarshalled GetWindowsSku() to equal Datacenter-Core-1809-with-Containers-smalldisk, got %s", windowsSku)
+	}
+
+	dv = unmarshalled.GetWindowsDockerVersion()
+	if dv != "18.03.1-ee-3" {
+		t.Fatalf("Expected unmarshalled GetWindowsDockerVersion() to equal 18.03.1-ee-3, got %s", dv)
+	}
+
+	windowsSku = unmarshalled.GetWindowsSku()
+	if windowsSku != "Datacenter-Core-1809-with-Containers-smalldisk" {
+		t.Fatalf("Expected unmarshalled GetWindowsSku() to equal Datacenter-Core-1809-with-Containers-smalldisk, got %s", windowsSku)
+	}
+
+	se = unmarshalled.GetSSHEnabled()
+	if !se {
+		t.Fatalf("Expected unmarshalled SSHEnabled to return true, got %v", se)
+	}
+
+	if unmarshalled.WindowsGmsaPackageUrl != "windows-gmsa-package-url" {
+		t.Fatalf("Expected unmarshalled WindowsGMSAPackageURL to equal windows-gmsa-package-url, got %s", unmarshalled.WindowsGmsaPackageUrl)
+	}
+
+	if unmarshalled.WindowsSecureTlsEnabled == nil {
+		t.Fatalf("Execpted unmarshalled WindowsSecureTLSEnabled to not be nil")
+	}
+
+	if *unmarshalled.WindowsSecureTlsEnabled != false {
+		t.Fatalf("Expected unmarshalled WindowsSecureTLSEnabled to equal false, got %v", *unmarshalled.WindowsSecureTlsEnabled)
 	}
 }
 
@@ -2370,7 +2525,7 @@ func TestGetOrderedKubeletConfigStringForPowershell(t *testing.T) {
 				ImageGcLowThreshold:  to.Int32Ptr(60),
 				ImageGcHighThreshold: to.Int32Ptr(80),
 			},
-			expected: `"--address=0.0.0.0", "--allow-privileged=true", "--cloud-config=c:\k\azure.json", "--image-gc-high-threshold=80", "--image-gc-low-threshold=60"`, //nolint:lll
+			expected: `"--address=0.0.0.0", "--allow-privileged=true", "--cloud-config=c:\k\azure.json", "--image-gc-high-threshold=80", "--image-gc-low-threshold=60"`,
 		},
 		{
 			name: "custom configuration overrides default KubeletConfig",
@@ -2397,7 +2552,7 @@ func TestGetOrderedKubeletConfigStringForPowershell(t *testing.T) {
 				ContainerLogMaxSizeMB: to.Int32Ptr(1024),
 				ContainerLogMaxFiles:  to.Int32Ptr(20),
 			},
-			expected: `"--address=127.0.0.1", "--allow-privileged=true", "--cloud-config=c:\k\azure.json", "--container-log-max-files=20", "--container-log-max-size=1024Mi"`, //nolint:lll
+			expected: `"--address=127.0.0.1", "--allow-privileged=true", "--cloud-config=c:\k\azure.json", "--container-log-max-files=20", "--container-log-max-size=1024Mi"`,
 		},
 		{
 			name: "custom configuration does not override default KubeletConfig",
@@ -2439,6 +2594,47 @@ func TestGetOrderedKubeletConfigStringForPowershell(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
 			actual := c.config.GetOrderedKubeletConfigStringForPowershell(c.CustomKubeletConfig)
+			if c.expected != actual {
+				t.Fatalf("test case: %s, expected: %s. Got: %s.", c.name, c.expected, actual)
+			}
+		})
+	}
+}
+
+func TestSecurityProfileGetProxyAddress(t *testing.T) {
+	testProxyAddress := "https://test-private-egress-proxy"
+	cases := []struct {
+		name            string
+		securityProfile *SecurityProfile
+		expected        string
+	}{
+		{
+			name:            "SecurityProfile nil",
+			securityProfile: nil,
+			expected:        "",
+		},
+		{
+			name:            "PrivateEgress nil",
+			securityProfile: &SecurityProfile{},
+			expected:        "",
+		},
+		{
+			name:            "PrivateEgress disabled",
+			securityProfile: &SecurityProfile{PrivateEgress: &PrivateEgress{Enabled: false}},
+			expected:        "",
+		},
+		{
+			name:            "PrivateEgress enabled",
+			securityProfile: &SecurityProfile{PrivateEgress: &PrivateEgress{Enabled: true, ProxyAddress: testProxyAddress}},
+			expected:        testProxyAddress,
+		},
+	}
+
+	for _, c := range cases {
+		c := c
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			actual := c.securityProfile.GetProxyAddress()
 			if c.expected != actual {
 				t.Fatalf("test case: %s, expected: %s. Got: %s.", c.name, c.expected, actual)
 			}

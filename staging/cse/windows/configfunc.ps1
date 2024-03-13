@@ -7,24 +7,37 @@ function Set-TelemetrySetting
         [Parameter(Mandatory=$true)][string]
         $WindowsTelemetryGUID
     )
+    Logs-To-Event -TaskName "AKS.WindowsCSE.SetTelemetrySetting" -TaskMessage "Start to apply telemetry data setting. WindowsTelemetryGUID: $global:WindowsTelemetryGUID"
     Set-ItemProperty -Path "HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\DataCollection" -Name "CommercialId" -Value $WindowsTelemetryGUID -Force
 }
 
 # Resize the system partition to the max available size. Azure can resize a managed disk, but the VM still needs to extend the partition boundary
+# This approach was recommended by the Windows Storage team to avoid performance delay when calling Get-PartitionSupportedSize
 function Resize-OSDrive
 {
-    $osDrive = ((Get-WmiObject Win32_OperatingSystem).SystemDrive).TrimEnd(":")
-    $size = (Get-Partition -DriveLetter $osDrive).Size
-    $maxSize = (Get-PartitionSupportedSize -DriveLetter $osDrive).SizeMax
-    if ($size -lt $maxSize)
-    {
-        Resize-Partition -DriveLetter $osDrive -Size $maxSize
+    Logs-To-Event -TaskName "AKS.WindowsCSE.ResizeOSDrive" -TaskMessage "Start to resize os drive if possible"
+    try {
+        $osDrive = ((Get-WmiObject Win32_OperatingSystem -ErrorAction Stop).SystemDrive).TrimEnd(":")
+
+        # Ensure the OS volume needs to be expanded, diskpart will fail if the partition is already expanded
+        $osDisk = Get-Partition -DriveLetter $osDrive | Get-Disk
+        if ($osDisk.Size - $osDisk.AllocatedSize -gt 1GB)
+        {
+            # Create a diskpart script (text file) that will select the OS volume, extend it and exit.
+            $diskpartScriptPath = [String]::Format("{0}\\diskpart_extendOSVol.script", $env:temp)
+            [String]::Format("select volume {0}`nextend`nexit", $osDrive) | Out-File -Encoding "UTF8" $diskpartScriptPath
+            Invoke-Executable -Executable "diskpart.exe" -ArgList @("/s", $diskpartScriptPath) -ExitCode $global:WINDOWS_CSE_ERROR_RESIZE_OS_DRIVE
+            Remove-Item -Path $diskpartScriptPath -Force
+        }
+    } catch {
+        Set-ExitCode -ExitCode $global:WINDOWS_CSE_ERROR_RESIZE_OS_DRIVE -ErrorMessage "Failed to resize os drive. Error: $_"
     }
 }
 
 # https://docs.microsoft.com/en-us/powershell/module/storage/new-partition
 function Initialize-DataDisks
 {
+    Logs-To-Event -TaskName "AKS.WindowsCSE.InitializeDataDisks" -TaskMessage "Start to initialize data disks"
     Get-Disk | Where-Object PartitionStyle -eq 'raw' | Initialize-Disk -PartitionStyle MBR -PassThru | New-Partition -UseMaximumSize -AssignDriveLetter | Format-Volume -FileSystem NTFS -Force
 }
 
@@ -33,6 +46,8 @@ function Initialize-DataDisks
 # (This only affects installations with UI)
 function Set-Explorer
 {
+    Logs-To-Event -TaskName "AKS.WindowsCSE.SetExplorer" -TaskMessage "Start to disable Internet Explorer compat mode and set homepage"
+
     New-Item -Path HKLM:"\\SOFTWARE\\Policies\\Microsoft\\Internet Explorer"
     New-Item -Path HKLM:"\\SOFTWARE\\Policies\\Microsoft\\Internet Explorer\\BrowserEmulation"
     New-ItemProperty -Path HKLM:"\\SOFTWARE\\Policies\\Microsoft\\Internet Explorer\\BrowserEmulation" -Name IntranetCompatibilityMode -Value 0 -Type DWord
@@ -40,81 +55,18 @@ function Set-Explorer
     New-ItemProperty -Path HKLM:"\\SOFTWARE\\Policies\\Microsoft\\Internet Explorer\\Main" -Name "Start Page" -Type String -Value http://bing.com
 }
 
-function Install-Docker
-{
-    Param(
-        [Parameter(Mandatory=$true)][string]
-        $DockerVersion
-    )
-
-    Write-Log "Docker version $DockerVersion found, clearing DOCKER_API_VERSION"
-    [System.Environment]::SetEnvironmentVariable('DOCKER_API_VERSION', $null, [System.EnvironmentVariableTarget]::Machine)
-
-    try {
-        $installDocker = $true
-        $dockerService = Get-Service | ? Name -like 'docker'
-        if ($dockerService.Count -eq 0) {
-            Write-Log "Docker is not installed. Install docker version($DockerVersion)."
-        }
-        else {
-            $dockerServerVersion = docker version --format '{{.Server.Version}}'
-            Write-Log "Docker service is installed with docker version($dockerServerVersion)."
-            if ($dockerServerVersion -eq $DockerVersion) {
-                $installDocker = $false
-                Write-Log "Same version docker installed will skip installing docker version($dockerServerVersion)."
-            }
-            else {
-                Write-Log "Same version docker is not installed. Will install docker version($DockerVersion)."
-            }
-        }
-
-        if ($installDocker) {
-            Find-Package -Name Docker -ProviderName DockerMsftProvider -RequiredVersion $DockerVersion -ErrorAction Stop
-            Write-Log "Found version $DockerVersion. Installing..."
-            Install-Package -Name Docker -ProviderName DockerMsftProvider -Update -Force -RequiredVersion $DockerVersion
-            net start docker
-            Write-Log "Installed version $DockerVersion"
-        }
-    } catch {
-        Write-Log "Error while installing package: $_.Exception.Message"
-        $currentDockerVersion = (Get-Package -Name Docker -ProviderName DockerMsftProvider).Version
-        Write-Log "Not able to install docker version. Using default version $currentDockerVersion"
-    }
-}
-
-function Set-DockerLogFileOptions {
-    Write-Log "Updating log file options in docker config"
-    $dockerConfigPath = "C:\ProgramData\docker\config\daemon.json"
-
-    if (-not (Test-Path $dockerConfigPath)) {
-        "{}" | Out-File $dockerConfigPath
-    }
-
-    $dockerConfig = Get-Content $dockerConfigPath | ConvertFrom-Json
-    $dockerConfig | Add-Member -Name "log-driver" -Value "json-file" -MemberType NoteProperty
-    $logOpts = @{ "max-size" = "50m"; "max-file" = "5" }
-    $dockerConfig | Add-Member -Name "log-opts" -Value $logOpts -MemberType NoteProperty
-    $dockerConfig = $dockerConfig | ConvertTo-Json -Depth 10
-
-    Write-Log "New docker config:"
-    Write-Log $dockerConfig
-
-    # daemon.json MUST be encoded as UTF8-no-BOM!
-    Remove-Item $dockerConfigPath
-    $fileEncoding = New-Object System.Text.UTF8Encoding $false
-    [IO.File]::WriteAllLInes($dockerConfigPath, $dockerConfig, $fileEncoding)
-
-    Restart-Service docker
-}
-
 # Pagefile adjustments
 function Adjust-PageFileSize()
 {
+    Logs-To-Event -TaskName "AKS.WindowsCSE.AdjustPageFileSize" -TaskMessage "Start to adjust pagefile size"
+
     wmic pagefileset set InitialSize=8096,MaximumSize=8096
 }
 
 function Adjust-DynamicPortRange()
 {
+    Logs-To-Event -TaskName "AKS.WindowsCSE.AdjustDynamicPortRange" -TaskMessage "Start to adjust dynamic port range"
+
     # Kube-proxy reserves 63 ports per service which limits clusters with Windows nodes
     # to ~225 services if default port reservations are used.
     # https://docs.microsoft.com/en-us/virtualization/windowscontainers/kubernetes/common-problems#load-balancers-are-plumbed-inconsistently-across-the-cluster-nodes
@@ -137,13 +89,11 @@ function Adjust-DynamicPortRange()
 # Service start actions. These should be split up later and included in each install step
 function Update-ServiceFailureActions
 {
-    Param(
-        [Parameter(Mandatory = $true)][string]
-        $ContainerRuntime
-    )
+    Logs-To-Event -TaskName "AKS.WindowsCSE.UpdateServiceFailureActions" -TaskMessage "Start to update service failure actions"
+
     sc.exe failure "kubelet" actions= restart/60000/restart/60000/restart/60000 reset= 900
     sc.exe failure "kubeproxy" actions= restart/60000/restart/60000/restart/60000 reset= 900
-    sc.exe failure $ContainerRuntime actions= restart/60000/restart/60000/restart/60000 reset= 900
+    sc.exe failure "containerd" actions= restart/60000/restart/60000/restart/60000 reset= 900
 }
 
 function Add-SystemPathEntry
@@ -235,6 +185,7 @@ function Install-GmsaPlugin {
         [Parameter(Mandatory=$true)]
         [String] $GmsaPackageUrl
     )
+    Logs-To-Event -TaskName "AKS.WindowsCSE.InstallGmsaPlugin" -TaskMessage "Start to install Windows gmsa package. WindowsGmsaPackageUrl: $global:WindowsGmsaPackageUrl"
 
     $tempInstallPackageFoler = [Io.path]::Combine($env:TEMP, "CCGAKVPlugin")
     $tempPluginZipFile = [Io.path]::Combine($ENV:TEMP, "gmsa.zip")
@@ -333,6 +284,7 @@ function Install-OpenSSH {
         [Parameter(Mandatory = $true)][string[]] 
         $SSHKeys
     )
+    Logs-To-Event -TaskName "AKS.WindowsCSE.InstallOpenSSH" -TaskMessage "Start to install OpenSSH"
 
     $adminpath = "c:\ProgramData\ssh"
     $adminfile = "administrators_authorized_keys"
@@ -395,6 +347,8 @@ function New-CsiProxyService {
         $KubeDir
     )
 
+    Logs-To-Event -TaskName "AKS.WindowsCSE.StartCsiProxyService" -TaskMessage "Start Csi proxy service. CsiProxyUrl: $global:CsiProxyUrl"
+
     $tempdir = New-TemporaryDirectory
     $binaryPackage = "$tempdir\csiproxy.tar"
 
@@ -424,6 +378,8 @@ function New-CsiProxyService {
 }
 
 function New-HostsConfigService {
+    Logs-To-Event -TaskName "AKS.WindowsCSE.StartHostConfigService" -TaskMessage "Start hosts config agent"
+
     $HostsConfigParameters = [io.path]::Combine($KubeDir, "hostsconfigagent.ps1")
 
     & "$KubeDir\nssm.exe" install hosts-config-agent C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe | RemoveNulls
@@ -464,6 +420,8 @@ function Enable-GuestVMLogs {
         [Parameter(Mandatory = $true)][int]
         $IntervalInMinutes
     )
+    Logs-To-Event -TaskName "AKS.WindowsCSE.EnableGuestVMLogs" -TaskMessage "Start to enable Guest VM Logs. LogGeneratorIntervalInMinutes: $LogGeneratorIntervalInMinutes"
+
     if ($IntervalInMinutes -le 0) {
         Write-Log "Do not add AKS logs in GuestVMLogs"
         return
@@ -516,5 +474,60 @@ function Upload-GuestVMLogs {
     } catch {
         # This should not impact the node provisioning result
         Write-Log "Failed to upload CustomDataSetupScript.log. $_"
+    }
+}
+
+# Retag-ImagesForAzureChinaCloud add tags for images for AzureChinaCloud to
+# use cached images instead of pulling them from MCR
+# This must be run after installing containerd but before New-InfraContainer
+function Retag-ImagesForAzureChinaCloud {
+    param(
+        [Parameter(Mandatory=$true)][string]
+        $TargetEnvironment
+    )
+
+    Logs-To-Event -TaskName "AKS.WindowsCSE.RetagImagesForAzureChinaCloud" -TaskMessage "Start to retag images for Azure China Cloud"
+    
+    $isExist=$false
+    $imageList=$(ctr.exe -n k8s.io image ls | select -Skip 1)
+    foreach ($imageInfo in $imageList) {
+        $splitResult=($imageInfo -split '\s+')
+        $image=$splitResult[0]
+        if ($image -like 'mcr.azk8s.cn*') {
+            $isExist=$true
+            break
+        }
+    }
+    
+    if ($TargetEnvironment -ne "AzureChinaCloud") {
+        if ($isExist) {
+            Write-Log "Clear existing tags for AzureChinaCloud in $TargetEnvironment"
+            foreach ($imageInfo in $imageList) {
+                $splitResult=($imageInfo -split '\s+')
+                $image=$splitResult[0]
+                if ($image -like 'mcr.azk8s.cn*' -and (-not $image.Contains("@sha256:"))) {
+                    ctr.exe -n k8s.io image delete $image
+                }
+            }
+        }
+        Write-Log "Not retagging images for $TargetEnvironment"
+        return
+    }
+
+    # Skip if we have already retagged the images in building VHDs
+    if ($isExist) {
+        Write-Log "Skip because images have already been retagged for AzureChinaCloud"
+        return
+    }
+
+    Write-Log "Retagging images for AzureChinaCloud"
+    foreach ($imageInfo in $imageList) {
+        $splitResult=($imageInfo -split '\s+')
+        $image=$splitResult[0]
+        if ($image -like 'mcr.microsoft.com*' -and (-not $image.Contains("@sha256:"))) {
+            Write-Log "Retagging image $image for AzureChinaCloud"
+            $retagImageUrl=$image.replace('mcr.microsoft.com', 'mcr.azk8s.cn')
+            ctr.exe -n k8s.io image tag $image $retagImageUrl
+        }
     }
 }

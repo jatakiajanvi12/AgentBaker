@@ -1,5 +1,5 @@
 #!/bin/bash
-# ERR_SYSTEMCTL_ENABLE_FAIL=3 Service could not be enabled by systemctl -- DEPRECATED 
+# ERR_SYSTEMCTL_ENABLE_FAIL=3 Service could not be enabled by systemctl -- DEPRECATED
 ERR_SYSTEMCTL_START_FAIL=4 # Service could not be started or enabled by systemctl
 ERR_CLOUD_INIT_TIMEOUT=5 # Timeout waiting for cloud-init runcmd to complete
 ERR_FILE_WATCH_TIMEOUT=6 # Timeout waiting for a file
@@ -38,6 +38,7 @@ ERR_K8S_API_SERVER_AZURE_DNS_LOOKUP_FAIL=53 # Unable to resolve k8s api server n
 ERR_KATA_KEY_DOWNLOAD_TIMEOUT=60 # Timeout waiting to download kata repo key
 ERR_KATA_APT_KEY_TIMEOUT=61 # Timeout waiting for kata apt-key
 ERR_KATA_INSTALL_TIMEOUT=62 # Timeout waiting for kata install
+ERR_VHD_FILE_NOT_FOUND=65 # VHD log file not found on VM built from VHD distro (previously classified as exit code 124)
 ERR_CONTAINERD_DOWNLOAD_TIMEOUT=70 # Timeout waiting for containerd downloads
 ERR_RUNC_DOWNLOAD_TIMEOUT=71 # Timeout waiting for runc downloads
 ERR_CUSTOM_SEARCH_DOMAINS_FAIL=80 # Unable to configure custom search domains
@@ -68,7 +69,7 @@ ERR_AZURE_STACK_GET_ARM_TOKEN=120 # Error generating a token to use with Azure R
 ERR_AZURE_STACK_GET_NETWORK_CONFIGURATION=121 # Error fetching the network configuration for the node
 ERR_AZURE_STACK_GET_SUBNET_PREFIX=122 # Error fetching the subnet address prefix for a subnet ID
 
-ERR_VHD_FILE_NOT_FOUND=124 # VHD log file not found on VM built from VHD distro
+# Error code 124 is returned when a `timeout` command times out, and --preserve-status is not specified: https://man7.org/linux/man-pages/man1/timeout.1.html
 ERR_VHD_BUILD_ERROR=125 # Reserved for VHD CI exit conditions
 
 ERR_SWAP_CREATE_FAIL=130 # Error allocating swap file
@@ -76,9 +77,12 @@ ERR_SWAP_CREATE_INSUFFICIENT_DISK_SPACE=131 # Error insufficient disk space for 
 
 ERR_TELEPORTD_DOWNLOAD_ERR=150 # Error downloading teleportd binary
 ERR_TELEPORTD_INSTALL_ERR=151 # Error installing teleportd binary
+ERR_ARTIFACT_STREAMING_DOWNLOAD=152 # Error downloading mirror proxy and overlaybd components
+ERR_ARTIFACT_STREAMING_INSTALL=153 # Error installing mirror proxy and overlaybd components
 
 ERR_HTTP_PROXY_CA_CONVERT=160 # Error converting http proxy ca cert from pem to crt format
 ERR_UPDATE_CA_CERTS=161 # Error updating ca certs to include user-provided certificates
+ERR_DOWNLOAD_SECURE_TLS_BOOTSTRAP_KUBELET_EXEC_PLUGIN_TIMEOUT=169 # Timeout waiting for secure TLS bootrstrap kubelet exec plugin download
 
 ERR_DISBALE_IPTABLES=170 # Error disabling iptables service
 
@@ -87,8 +91,15 @@ ERR_DISABLE_SSH=172 # Error disabling ssh service
 
 ERR_VHD_REBOOT_REQUIRED=200 # Reserved for VHD reboot required exit condition
 ERR_NO_PACKAGES_FOUND=201 # Reserved for no security packages found exit condition
+ERR_SNAPSHOT_UPDATE_START_FAIL=202 # snapshot-update could not be started by systemctl
+
+ERR_PRIVATE_K8S_PKG_ERR=203 # Error downloading (at build-time) or extracting (at run-time) private kubernetes packages
+ERR_K8S_INSTALL_ERR=204 # Error installing or setting up kubernetes binaries on disk
+
+ERR_SYSTEMCTL_MASK_FAIL=2 # Service could not be masked by systemctl
 
 OS=$(sort -r /etc/*-release | gawk 'match($0, /^(ID_LIKE=(coreos)|ID=(.*))$/, a) { print toupper(a[2] a[3]); exit }')
+OS_VERSION=$(sort -r /etc/*-release | gawk 'match($0, /^(VERSION_ID=(.*))$/, a) { print toupper(a[2] a[3]); exit }' | tr -d '"')
 UBUNTU_OS_NAME="UBUNTU"
 MARINER_OS_NAME="MARINER"
 KUBECTL=/usr/local/bin/kubectl
@@ -102,7 +113,7 @@ export GPU_DEST=/usr/local/nvidia
 NVIDIA_DOCKER_VERSION=2.8.0-1
 DOCKER_VERSION=1.13.1-1
 NVIDIA_CONTAINER_RUNTIME_VERSION="3.6.0"
-export NVIDIA_DRIVER_IMAGE_SHA="sha-dc8c1a"
+export NVIDIA_DRIVER_IMAGE_SHA="${GPU_IMAGE_SHA:=}"
 export NVIDIA_DRIVER_IMAGE_TAG="${GPU_DV}-${NVIDIA_DRIVER_IMAGE_SHA}"
 export NVIDIA_DRIVER_IMAGE="mcr.microsoft.com/aks/aks-gpu"
 export CTR_GPU_INSTALL_CMD="ctr run --privileged --rm --net-host --with-ns pid:/proc/1/ns/pid --mount type=bind,src=/opt/gpu,dst=/mnt/gpu,options=rbind --mount type=bind,src=/opt/actions,dst=/mnt/actions,options=rbind"
@@ -110,6 +121,7 @@ export DOCKER_GPU_INSTALL_CMD="docker run --privileged --net=host --pid=host -v 
 APT_CACHE_DIR=/var/cache/apt/archives/
 PERMANENT_CACHE_DIR=/root/aptcache/
 EVENTS_LOGGING_DIR=/var/log/azure/Microsoft.Azure.Extensions.CustomScript/events/
+CURL_OUTPUT=/tmp/curl_verbose.out
 
 retrycmd_if_failure() {
     retries=$1; wait_sleep=$2; timeout=$3; shift && shift && shift
@@ -123,6 +135,22 @@ retrycmd_if_failure() {
         fi
     done
     echo Executed \"$@\" $i times;
+}
+retrycmd_nslookup() {
+    wait_sleep=$1; timeout=$2; total_timeout=$3; record=$4
+    start_time=$(date +%s)
+    while true; do
+        nslookup -timeout=$timeout -retry=0 $record && break || \
+        current_time=$(date +%s)
+        # Check if the total_timeout has been reached
+        if [ $((current_time - start_time)) -ge $total_timeout ]; then
+            echo "Total timeout $total_timeout reached, nslookup -timeout=$timeout -retry=0 $record failed"
+            return 1
+        fi
+        sleep $wait_sleep
+    done
+    current_time=$(date +%s)
+    echo "Executed nslookup -timeout=$timeout -retry=0 $record for $((current_time - start_time)) seconds";
 }
 retrycmd_if_failure_no_stats() {
     retries=$1; wait_sleep=$2; timeout=$3; shift && shift && shift
@@ -143,7 +171,10 @@ retrycmd_get_tarball() {
         if [ $i -eq $tar_retries ]; then
             return 1
         else
-            timeout 60 curl -fsSLv $url -o $tarball
+            timeout 60 curl -fsSLv $url -o $tarball > $CURL_OUTPUT 2>&1
+            if [[ $? != 0 ]]; then
+                cat $CURL_OUTPUT
+            fi
             sleep $wait_sleep
         fi
     done
@@ -156,7 +187,10 @@ retrycmd_curl_file() {
         if [ $i -eq $curl_retries ]; then
             return 1
         else
-            timeout $timeout curl -fsSLv $url -o $filepath
+            timeout $timeout curl -fsSLv $url -o $filepath 2>&1 | tee $CURL_OUTPUT >/dev/null
+            if [[ $? != 0 ]]; then
+                cat $CURL_OUTPUT
+            fi
             sleep $wait_sleep
         fi
     done
@@ -184,6 +218,8 @@ systemctl_restart() {
         if [ $i -eq $retries ]; then
             return 1
         else
+            systemctl status $svcname --no-pager -l
+            journalctl -u $svcname
             sleep $wait_sleep
         fi
     done
@@ -248,7 +284,7 @@ systemctlDisableAndStop() {
     fi
 }
 
-# return true if a >= b 
+# return true if a >= b
 semverCompare() {
     VERSION_A=$(echo $1 | cut -d "+" -f 1)
     VERSION_B=$(echo $2 | cut -d "+" -f 1)
@@ -317,7 +353,7 @@ logs_to_events() {
         --arg Version     "1.23" \
         --arg TaskName    "${task}" \
         --arg EventLevel  "Informational" \
-        --arg Message     "Completed: ${@}" \
+        --arg Message     "Completed: $*" \
         --arg EventPid    "0" \
         --arg EventTid    "0" \
         '{Timestamp: $Timestamp, OperationId: $OperationId, Version: $Version, TaskName: $TaskName, EventLevel: $EventLevel, Message: $Message, EventPid: $EventPid, EventTid: $EventTid}'
@@ -329,4 +365,52 @@ logs_to_events() {
       return $ret
     fi
 }
+
+should_skip_nvidia_drivers() {
+    set -x
+    body=$(curl -fsSL -H "Metadata: true" --noproxy "*" "http://169.254.169.254/metadata/instance?api-version=2021-02-01")
+    ret=$?
+    if [ "$ret" != "0" ]; then
+      return $ret
+    fi
+    should_skip=$(echo "$body" | jq -e '.compute.tagsList | map(select(.name | test("SkipGpuDriverInstall"; "i")))[0].value // "false" | test("true"; "i")')
+    echo "$should_skip"
+}
+
+start_watch () {
+  capture_time=$(date +%s)
+  start_timestamp=$(date +%H:%M:%S)
+}
+
+stop_watch () {
+
+  local current_time=$(date +%s)
+  local end_timestamp=$(date +%H:%M:%S)
+  local difference_in_seconds=$((current_time - ${1}))
+
+  local elapsed_hours=$(($difference_in_seconds/3600))
+  local elapsed_minutes=$((($difference_in_seconds%3600)/60))
+  local elapsed_seconds=$(($difference_in_seconds%60))
+  
+  printf -v benchmark "'${2}' - Total Time Elapsed: %02d:%02d:%02d" $elapsed_hours $elapsed_minutes $elapsed_seconds
+  if [ ${3} == true ]; then
+    printf -v start "     Start time: $script_start_timestamp"
+  else
+    printf -v start "     Start time: $start_timestamp"
+  fi
+  printf -v end "     End Time: $end_timestamp"
+  echo -e "\n$benchmark\n"
+  benchmarks+=("$benchmark")
+  benchmarks+=("$start")
+  benchmarks+=("$end")
+}
+
+show_benchmarks () {
+  echo -e "\nBenchmarks:\n"
+  for i in "${benchmarks[@]}"; do
+    echo "   $i"
+  done
+  echo
+}
+
 #HELPERSEOF

@@ -8,7 +8,6 @@ After=network-online.target containerd.service
 Restart=always
 RestartSec=2
 EnvironmentFile=/etc/default/kubelet
-# Graceful termination (SIGTERM)
 SuccessExitStatus=143
 ExecStartPre=/bin/bash /opt/azure/containers/kubelet.sh
 ExecStartPre=/bin/mkdir -p /var/lib/kubelet
@@ -27,6 +26,7 @@ ExecStart=/usr/local/bin/kubelet \
         $KUBELET_TLS_BOOTSTRAP_FLAGS \
         $KUBELET_CONFIG_FILE_FLAGS \
         $KUBELET_CONTAINERD_FLAGS \
+        $KUBELET_CONTAINER_RUNTIME_FLAG \
         $KUBELET_CGROUP_FLAGS \
         $KUBELET_FLAGS
 

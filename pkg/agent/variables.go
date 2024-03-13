@@ -46,14 +46,20 @@ func getCustomDataVariables(config *datamodel.NodeBootstrappingConfiguration) pa
 			"tlsBootstrapDropin":           getBase64EncodedGzippedCustomScript(tlsBootstrapDropin, config),
 			"bindMountDropin":              getBase64EncodedGzippedCustomScript(bindMountDropin, config),
 			"httpProxyDropin":              getBase64EncodedGzippedCustomScript(httpProxyDropin, config),
+			"snapshotUpdateScript":         getBase64EncodedGzippedCustomScript(snapshotUpdateScript, config),
+			"snapshotUpdateService":        getBase64EncodedGzippedCustomScript(snapshotUpdateSystemdService, config),
+			"snapshotUpdateTimer":          getBase64EncodedGzippedCustomScript(snapshotUpdateSystemdTimer, config),
+			"packageUpdateScriptMariner":   getBase64EncodedGzippedCustomScript(packageUpdateScriptMariner, config),
+			"packageUpdateServiceMariner":  getBase64EncodedGzippedCustomScript(packageUpdateSystemdServiceMariner, config),
+			"packageUpdateTimerMariner":    getBase64EncodedGzippedCustomScript(packageUpdateSystemdTimerMariner, config),
 			"componentManifestFile":        getBase64EncodedGzippedCustomScript(componentManifestFile, config),
 		},
 	}
 
-	cloudInitData := cloudInitFiles["cloudInitData"].(paramsMap)
+	cloudInitData := cloudInitFiles["cloudInitData"].(paramsMap) //nolint:errcheck // no error is actually here
 	if cs.IsAKSCustomCloud() {
 		// TODO(ace): do we care about both? 2nd one should be more general and catch custom VHD for mariner.
-		if config.AgentPoolProfile.Distro.IsCBLMarinerDistro() || isMariner(config.OSSKU) {
+		if config.AgentPoolProfile.Distro.IsAzureLinuxDistro() || isMariner(config.OSSKU) {
 			cloudInitData["initAKSCustomCloud"] = getBase64EncodedGzippedCustomScript(initAKSCustomCloudMarinerScript, config)
 		} else {
 			cloudInitData["initAKSCustomCloud"] = getBase64EncodedGzippedCustomScript(initAKSCustomCloudScript, config)
@@ -64,12 +70,6 @@ func getCustomDataVariables(config *datamodel.NodeBootstrappingConfiguration) pa
 		cloudInitData["provisionCIS"] = getBase64EncodedGzippedCustomScript(kubernetesCISScript, config)
 		cloudInitData["kmsSystemdService"] = getBase64EncodedGzippedCustomScript(kmsSystemdService, config)
 		cloudInitData["aptPreferences"] = getBase64EncodedGzippedCustomScript(aptPreferences, config)
-		cloudInitData["healthMonitorScript"] = getBase64EncodedGzippedCustomScript(kubernetesHealthMonitorScript, config)
-		cloudInitData["kubeletMonitorSystemdService"] = getBase64EncodedGzippedCustomScript(kubernetesKubeletMonitorSystemdService, config)
-		cloudInitData["dockerMonitorSystemdService"] = getBase64EncodedGzippedCustomScript(kubernetesDockerMonitorSystemdService, config)
-		cloudInitData["dockerMonitorSystemdTimer"] = getBase64EncodedGzippedCustomScript(kubernetesDockerMonitorSystemdTimer, config)
-		cloudInitData["containerdMonitorSystemdService"] = getBase64EncodedGzippedCustomScript(kubernetesContainerdMonitorSystemdService, config)
-		cloudInitData["containerdMonitorSystemdTimer"] = getBase64EncodedGzippedCustomScript(kubernetesContainerdMonitorSystemdTimer, config)
 		cloudInitData["dockerClearMountPropagationFlags"] = getBase64EncodedGzippedCustomScript(dockerClearMountPropagationFlags, config)
 	}
 
@@ -104,8 +104,10 @@ func getWindowsCustomDataVariables(config *datamodel.NodeBootstrappingConfigurat
 		"windowsPauseImageURL":                 cs.Properties.WindowsProfile.WindowsPauseImageURL,
 		"alwaysPullWindowsPauseImage":          strconv.FormatBool(cs.Properties.WindowsProfile.IsAlwaysPullWindowsPauseImage()),
 		"windowsCalicoPackageURL":              cs.Properties.WindowsProfile.WindowsCalicoPackageURL,
+		"configGPUDriverIfNeeded":              config.ConfigGPUDriverIfNeeded,
 		"windowsSecureTlsEnabled":              cs.Properties.WindowsProfile.IsWindowsSecureTlsEnabled(),
 		"windowsGmsaPackageUrl":                cs.Properties.WindowsProfile.WindowsGmsaPackageUrl,
+		"windowsGpuDriverURL":                  cs.Properties.WindowsProfile.GpuDriverURL,
 		"windowsCSEScriptsPackageURL":          cs.Properties.WindowsProfile.CseScriptsPackageURL,
 		"isDisableWindowsOutboundNat":          strconv.FormatBool(config.AgentPoolProfile.IsDisableWindowsOutboundNat()),
 	}
@@ -175,7 +177,8 @@ func getOutBoundCmd(nbc *datamodel.NodeBootstrappingConfiguration, cloudSpecConf
 	if cs.Properties.FeatureFlags.IsFeatureEnabled("BlockOutboundInternet") {
 		return ""
 	}
-	registry := ""
+
+	var registry string
 	switch {
 	case cloudSpecConfig.CloudName == datamodel.AzureChinaCloud:
 		registry = `gcr.azk8s.cn`
@@ -194,7 +197,7 @@ func getOutBoundCmd(nbc *datamodel.NodeBootstrappingConfiguration, cloudSpecConf
 	clusterVersion, _ := semver.Make(cs.Properties.OrchestratorProfile.OrchestratorVersion)
 	minVersion, _ := semver.Make("1.18.0")
 
-	connectivityCheckCommand := ""
+	var connectivityCheckCommand string
 	if clusterVersion.GTE(minVersion) {
 		connectivityCheckCommand = `curl -v --insecure --proxy-insecure https://` + registry + `/v2/`
 	} else {

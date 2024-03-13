@@ -1,5 +1,4 @@
 #!/bin/bash
-# Timeout waiting for a file
 ERR_FILE_WATCH_TIMEOUT=6 
 set -x
 if [ -f /opt/azure/containers/provision.complete ]; then
@@ -9,7 +8,6 @@ fi
 
 aptmarkWALinuxAgent hold &
 
-# Setup logs for upload to host
 LOG_DIR=/var/log/azure/aks
 mkdir -p ${LOG_DIR}
 ln -s /var/log/azure/cluster-provision.log \
@@ -19,8 +17,6 @@ ln -s /var/log/azure/cluster-provision.log \
       /opt/azure/vhd-install.complete \
       ${LOG_DIR}/
 
-# Redact the necessary secrets from cloud-config.txt so we don't expose any sensitive information
-# when cloud-config.txt gets included within log bundles
 python3 /opt/azure/containers/provision_redact_cloud_config.py \
     --cloud-config-path /var/lib/cloud/instance/cloud-config.txt \
     --output-path ${LOG_DIR}/cloud-config.txt
@@ -47,21 +43,16 @@ done
 sed -i "/#HELPERSEOF/d" "${CSE_HELPERS_FILEPATH}"
 source "${CSE_HELPERS_FILEPATH}"
 
-wait_for_file 3600 1 "${CSE_DISTRO_HELPERS_FILEPATH}" || exit $ERR_FILE_WATCH_TIMEOUT
 source "${CSE_DISTRO_HELPERS_FILEPATH}"
-
-wait_for_file 3600 1 "${CSE_INSTALL_FILEPATH}" || exit $ERR_FILE_WATCH_TIMEOUT
 source "${CSE_INSTALL_FILEPATH}"
-
-wait_for_file 3600 1 "${CSE_DISTRO_INSTALL_FILEPATH}" || exit $ERR_FILE_WATCH_TIMEOUT
 source "${CSE_DISTRO_INSTALL_FILEPATH}"
-
-wait_for_file 3600 1 "${CSE_CONFIG_FILEPATH}" || exit $ERR_FILE_WATCH_TIMEOUT
 source "${CSE_CONFIG_FILEPATH}"
 
 if [[ "${DISABLE_SSH}" == "true" ]]; then
     disableSSH || exit $ERR_DISABLE_SSH
 fi
+
+echo "private egress proxy address is '${PRIVATE_EGRESS_PROXY_ADDRESS}'"
 
 if [[ "${SHOULD_CONFIGURE_HTTP_PROXY}" == "true" ]]; then
     if [[ "${SHOULD_CONFIGURE_HTTP_PROXY_CA}" == "true" ]]; then
@@ -72,7 +63,7 @@ fi
 
 
 if [[ "${SHOULD_CONFIGURE_CUSTOM_CA_TRUST}" == "true" ]]; then
-    configureCustomCaCertificate || $ERR_UPDATE_CA_CERTS
+    configureCustomCaCertificate || exit $ERR_UPDATE_CA_CERTS
 fi
 
 if [[ -n "${OUTBOUND_COMMAND}" ]]; then
@@ -82,16 +73,22 @@ if [[ -n "${OUTBOUND_COMMAND}" ]]; then
     retrycmd_if_failure 50 1 5 $OUTBOUND_COMMAND >> /var/log/azure/cluster-provision-cse-output.log 2>&1 || exit $ERR_OUTBOUND_CONN_FAIL;
 fi
 
-# Bring in OS-related vars
 source /etc/os-release
 
-# Mandb is not currently available on MarinerV1
 if [[ ${ID} != "mariner" ]]; then
     echo "Removing man-db auto-update flag file..."
     logs_to_events "AKS.CSE.removeManDbAutoUpdateFlagFile" removeManDbAutoUpdateFlagFile
 fi
 
-if [[ "${GPU_NODE}" != "true" ]]; then
+export -f should_skip_nvidia_drivers
+skip_nvidia_driver_install=$(retrycmd_if_failure_no_stats 10 1 10 bash -cx should_skip_nvidia_drivers)
+ret=$?
+if [[ "$ret" != "0" ]]; then
+    echo "Failed to determine if nvidia driver install should be skipped"
+    exit $ERR_NVIDIA_DRIVER_INSTALL
+fi
+
+if [[ "${GPU_NODE}" != "true" ]] || [[ "${skip_nvidia_driver_install}" == "true" ]]; then
     logs_to_events "AKS.CSE.cleanUpGPUDrivers" cleanUpGPUDrivers
 fi
 
@@ -131,11 +128,14 @@ if [ "${IS_KRUSTLET}" == "true" ]; then
     logs_to_events "AKS.CSE.downloadKrustlet" downloadContainerdWasmShims
 fi
 
-# By default, never reboot new nodes.
+if [ "${ENABLE_SECURE_TLS_BOOTSTRAPPING}" == "true" ]; then
+    logs_to_events "AKS.CSE.downloadSecureTLSBootstrapKubeletExecPlugin" downloadSecureTLSBootstrapKubeletExecPlugin
+fi
+
 REBOOTREQUIRED=false
 
 echo $(date),$(hostname), "Start configuring GPU drivers"
-if [[ "${GPU_NODE}" = true ]]; then
+if [[ "${GPU_NODE}" = true ]] && [[ "${skip_nvidia_driver_install}" != "true" ]]; then
     logs_to_events "AKS.CSE.ensureGPUDrivers" ensureGPUDrivers
     if [[ "${ENABLE_GPU_DEVICE_PLUGIN_IF_NEEDED}" = true ]]; then
         if [[ "${MIG_NODE}" == "true" ]] && [[ -f "/etc/systemd/system/nvidia-device-plugin.service" ]]; then
@@ -151,34 +151,19 @@ EOF
     else
         logs_to_events "AKS.CSE.stop.nvidia-device-plugin" "systemctlDisableAndStop nvidia-device-plugin"
     fi
-fi
 
-if [[ "${GPU_NEEDS_FABRIC_MANAGER}" == "true" ]]; then
-    # fabric manager trains nvlink connections between multi instance gpus.
-    # it appears this is only necessary for systems with *multiple cards*.
-    # i.e., an A100 can be partitioned a maximum of 7 ways.
-    # An NC24ads_A100_v4 has one A100.
-    # An ND96asr_v4 has eight A100, for a maximum of 56 partitions.
-    # ND96 seems to require fabric manager *even when not using mig partitions*
-    # while it fails to install on NC24.
-    logs_to_events "AKS.CSE.nvidia-fabricmanager" "systemctlEnableAndStart nvidia-fabricmanager" || exit $ERR_GPU_DRIVERS_START_FAIL
-fi
+    if [[ "${GPU_NEEDS_FABRIC_MANAGER}" == "true" ]]; then
+        if [[ $OS == $MARINER_OS_NAME ]]; then
+            logs_to_events "AKS.CSE.installNvidiaFabricManager" installNvidiaFabricManager
+        fi
+        logs_to_events "AKS.CSE.nvidia-fabricmanager" "systemctlEnableAndStart nvidia-fabricmanager" || exit $ERR_GPU_DRIVERS_START_FAIL
+    fi
 
-# This will only be true for multi-instance capable VM sizes
-# for which the user has specified a partitioning profile.
-# it is valid to use mig-capable gpus without a partitioning profile.
-if [[ "${MIG_NODE}" == "true" ]]; then
-    # A100 GPU has a bit in the physical card (infoROM) to enable mig mode.
-    # Changing this bit in either direction requires a VM reboot on Azure (hypervisor/plaform stuff).
-    # Commands such as `nvidia-smi --gpu-reset` may succeed,
-    # while commands such as `nvidia-smi -q` will show mismatched current/pending mig mode.
-    # this will not be required per nvidia for next gen H100.
-    REBOOTREQUIRED=true
-    
-    # this service applies the partitioning scheme with nvidia-smi.
-    # we should consider moving to mig-parted which is simpler/newer.
-    # we couldn't because of old drivers but that has long been fixed.
-    logs_to_events "AKS.CSE.ensureMigPartition" ensureMigPartition
+    if [[ "${MIG_NODE}" == "true" ]]; then
+        REBOOTREQUIRED=true
+        
+        logs_to_events "AKS.CSE.ensureMigPartition" ensureMigPartition
+    fi
 fi
 
 echo $(date),$(hostname), "End configuring GPU drivers"
@@ -194,25 +179,21 @@ logs_to_events "AKS.CSE.installKubeletKubectlAndKubeProxy" installKubeletKubectl
 createKubeManifestDir
 
 if [ "${HAS_CUSTOM_SEARCH_DOMAIN}" == "true" ]; then
-    wait_for_file 3600 1 "${CUSTOM_SEARCH_DOMAIN_FILEPATH}" || exit $ERR_FILE_WATCH_TIMEOUT
     "${CUSTOM_SEARCH_DOMAIN_FILEPATH}" > /opt/azure/containers/setup-custom-search-domain.log 2>&1 || exit $ERR_CUSTOM_SEARCH_DOMAINS_FAIL
 fi
 
 
-# for drop ins, so they don't all have to check/create the dir
 mkdir -p "/etc/systemd/system/kubelet.service.d"
 
 logs_to_events "AKS.CSE.configureK8s" configureK8s
 
 logs_to_events "AKS.CSE.configureCNI" configureCNI
 
-# configure and enable dhcpv6 for dual stack feature
 if [ "${IPV6_DUAL_STACK_ENABLED}" == "true" ]; then
     logs_to_events "AKS.CSE.ensureDHCPv6" ensureDHCPv6
 fi
 
 if [ "${NEEDS_CONTAINERD}" == "true" ]; then
-    # containerd should not be configured until cni has been configured first
     logs_to_events "AKS.CSE.ensureContainerd" ensureContainerd 
 else
     logs_to_events "AKS.CSE.ensureDocker" ensureDocker
@@ -222,9 +203,6 @@ if [[ "${MESSAGE_OF_THE_DAY}" != "" ]]; then
     echo "${MESSAGE_OF_THE_DAY}" | base64 -d > /etc/motd
 fi
 
-# must run before kubelet starts to avoid race in container status using wrong image
-# https://github.com/kubernetes/kubernetes/issues/51017
-# can remove when fixed
 if [[ "${TARGET_CLOUD}" == "AzureChinaCloud" ]]; then
     retagMCRImagesForChina
 fi
@@ -249,17 +227,20 @@ EOF
 fi
 
 if [ "${NEEDS_CONTAINERD}" == "true" ]; then
-    # gross, but the backticks make it very hard to do in Go
-    # TODO: move entirely into vhd.
-    # alternatively, can we verify this is safe with docker?
-    # or just do it even if not because docker is out of support?
     mkdir -p /etc/containerd
     echo "${KUBENET_TEMPLATE}" | base64 -d > /etc/containerd/kubenet_template.conf
 
-    tee "/etc/systemd/system/kubelet.service.d/10-containerd.conf" > /dev/null <<'EOF'
+    tee "/etc/systemd/system/kubelet.service.d/10-containerd-base-flag.conf" > /dev/null <<'EOF'
 [Service]
-Environment="KUBELET_CONTAINERD_FLAGS=--container-runtime=remote --runtime-request-timeout=15m --container-runtime-endpoint=unix:///run/containerd/containerd.sock --runtime-cgroups=/system.slice/containerd.service"
+Environment="KUBELET_CONTAINERD_FLAGS=--runtime-request-timeout=15m --container-runtime-endpoint=unix:///run/containerd/containerd.sock --runtime-cgroups=/system.slice/containerd.service"
 EOF
+    
+    if ! semverCompare ${KUBERNETES_VERSION:-"0.0.0"} "1.27.0"; then
+        tee "/etc/systemd/system/kubelet.service.d/10-container-runtime-flag.conf" > /dev/null <<'EOF'
+[Service]
+Environment="KUBELET_CONTAINER_RUNTIME_FLAG=--container-runtime=remote"
+EOF
+    fi
 fi
 
 if [ "${HAS_KUBELET_DISK_TYPE}" == "true" ]; then
@@ -272,14 +253,21 @@ fi
 
 logs_to_events "AKS.CSE.ensureSysctl" ensureSysctl
 
+if [ "${NEEDS_CONTAINERD}" == "true" ] &&  [ "${SHOULD_CONFIG_CONTAINERD_ULIMITS}" == "true" ]; then
+  logs_to_events "AKS.CSE.setContainerdUlimits" configureContainerdUlimits
+fi
+
 logs_to_events "AKS.CSE.ensureKubelet" ensureKubelet
 if [ "${ENSURE_NO_DUPE_PROMISCUOUS_BRIDGE}" == "true" ]; then
     logs_to_events "AKS.CSE.ensureNoDupOnPromiscuBridge" ensureNoDupOnPromiscuBridge
 fi
 
+if [[ $OS == $UBUNTU_OS_NAME ]] || [[ $OS == $MARINER_OS_NAME ]]; then
+    logs_to_events "AKS.CSE.ubuntuSnapshotUpdate" ensureSnapshotUpdate
+fi
+
 if $FULL_INSTALL_REQUIRED; then
     if [[ $OS == $UBUNTU_OS_NAME ]]; then
-        # mitigation for bug https://bugs.launchpad.net/ubuntu/+source/linux/+bug/1676635 
         echo 2dd1ce17-079e-403c-b352-a1921ee207ee > /sys/bus/vmbus/drivers/hv_util/unbind
         sed -i "13i\echo 2dd1ce17-079e-403c-b352-a1921ee207ee > /sys/bus/vmbus/drivers/hv_util/unbind\n" /etc/rc.local
     fi
@@ -287,21 +275,17 @@ fi
 
 VALIDATION_ERR=0
 
-# Edge case scenarios:
-# high retry times to wait for new API server DNS record to replicate (e.g. stop and start cluster)
-# high timeout to address high latency for private dns server to forward request to Azure DNS
-# dns check will be done only if we use FQDN for API_SERVER_NAME
 API_SERVER_CONN_RETRIES=50
 if [[ $API_SERVER_NAME == *.privatelink.* ]]; then
     API_SERVER_CONN_RETRIES=100
 fi
 if ! [[ ${API_SERVER_NAME} =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    API_SERVER_DNS_RETRIES=100
+    API_SERVER_DNS_RETRY_TIMEOUT=300
     if [[ $API_SERVER_NAME == *.privatelink.* ]]; then
-       API_SERVER_DNS_RETRIES=200
+       API_SERVER_DNS_RETRY_TIMEOUT=600
     fi
     if [[ "${ENABLE_HOSTS_CONFIG_AGENT}" != "true" ]]; then
-        RES=$(logs_to_events "AKS.CSE.apiserverNslookup" "retrycmd_if_failure ${API_SERVER_DNS_RETRIES} 1 10 nslookup ${API_SERVER_NAME}")
+        RES=$(logs_to_events "AKS.CSE.apiserverNslookup" "retrycmd_nslookup 1 15 ${API_SERVER_DNS_RETRY_TIMEOUT} ${API_SERVER_NAME}")
         STS=$?
     else
         STS=0
@@ -330,12 +314,10 @@ if $REBOOTREQUIRED; then
     echo 'reboot required, rebooting node in 1 minute'
     /bin/bash -c "shutdown -r 1 &"
     if [[ $OS == $UBUNTU_OS_NAME ]]; then
-        # logs_to_events should not be run on & commands
         aptmarkWALinuxAgent unhold &
     fi
 else
     if [[ $OS == $UBUNTU_OS_NAME ]]; then
-        # logs_to_events should not be run on & commands
         if [ "${ENABLE_UNATTENDED_UPGRADES}" == "true" ]; then
             UU_CONFIG_DIR="/etc/apt/apt.conf.d/99periodic"
             mkdir -p "$(dirname "${UU_CONFIG_DIR}")"
@@ -347,9 +329,6 @@ else
             systemctl enable apt-daily.service apt-daily-upgrade.service
             systemctl enable apt-daily.timer apt-daily-upgrade.timer
             systemctl restart --no-block apt-daily.timer apt-daily-upgrade.timer            
-            # this is the DOWNLOAD service
-            # meaning we are wasting IO without even triggering an upgrade 
-            # -________________-
             systemctl restart --no-block apt-daily.service
             
         fi
@@ -357,21 +336,13 @@ else
     elif [[ $OS == $MARINER_OS_NAME ]]; then
         if [ "${ENABLE_UNATTENDED_UPGRADES}" == "true" ]; then
             if [ "${IS_KATA}" == "true" ]; then
-                # Currently kata packages must be updated as a unit (including the kernel which requires a reboot). This can
-                # only be done reliably via image updates as of now so never enable automatic updates.
                 echo 'EnableUnattendedUpgrade is not supported by kata images, will not be enabled'
             else
-                # By default the dnf-automatic is service is notify only in Mariner.
-                # Enable the automatic install timer and the check-restart timer.
-                # Stop the notify only dnf timer since we've enabled the auto install one.
-                # systemctlDisableAndStop adds .service to the end which doesn't work on timers.
                 systemctl disable dnf-automatic-notifyonly.timer
                 systemctl stop dnf-automatic-notifyonly.timer
-                # At 6:00:00 UTC (1 hour random fuzz) download and install package updates.
                 systemctl unmask dnf-automatic-install.service || exit $ERR_SYSTEMCTL_START_FAIL
                 systemctl unmask dnf-automatic-install.timer || exit $ERR_SYSTEMCTL_START_FAIL
                 systemctlEnableAndStart dnf-automatic-install.timer || exit $ERR_SYSTEMCTL_START_FAIL
-                # The check-restart service which will inform kured of required restarts should already be running
             fi
         fi
     fi
